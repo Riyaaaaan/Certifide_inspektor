@@ -14,6 +14,7 @@ import '../../../providers/inspection_provider.dart';
 import '../../../providers/stats_provider.dart';
 import '../../../routes/routes.dart';
 import '../../../services/app_update_service.dart';
+import '../../../services/notification_service.dart';
 import '../../../utils/network_error_helper.dart';
 import '../../attendance/attendance_screen.dart';
 import '../../work_assigned/work_assigned_screen.dart';
@@ -42,11 +43,35 @@ class _CarSpyHomeState extends ConsumerState<CarSpyHome> {
     super.initState();
     _selectedIndex = widget.initialIndex;
     _initHive();
+    // Now that the inspector is authenticated and a resumed Activity exists,
+    // make sure notification permission is granted (a prompt dismissed during
+    // cold launch gets a reliable second chance here), then register this
+    // device's FCM token with the backend. Both fire-and-forget.
+    NotificationService.ensurePermission()
+        .then((_) => NotificationService.syncToken());
+    // A notification tap may have requested a specific tab — honour it, and keep
+    // listening while this shell is alive.
+    NotificationService.requestedTab.addListener(_onTabRequested);
+    _onTabRequested();
     // Check for a Play Store update once the home screen is up (Android-only;
     // fire-and-forget, never blocks or disrupts the user).
     WidgetsBinding.instance.addPostFrameCallback((_) {
       const AppUpdateService().checkForUpdate();
     });
+  }
+
+  /// Switch to the tab a notification tap asked for (if any).
+  void _onTabRequested() {
+    final index = NotificationService.takePendingTab();
+    if (index != null && index >= 0 && index < carSpyBottomNavItems.length) {
+      if (mounted) setState(() => _selectedIndex = index);
+    }
+  }
+
+  @override
+  void dispose() {
+    NotificationService.requestedTab.removeListener(_onTabRequested);
+    super.dispose();
   }
 
   Future<void> _initHive() async {
@@ -882,7 +907,6 @@ class _CarSpyHomeState extends ConsumerState<CarSpyHome> {
       bottomNavigationBar: CarSpyBottomNavBar(
         selectedIndex: _selectedIndex,
         onTap: (index) => setState(() => _selectedIndex = index),
-        disabledIndices: const [3],
       ),
     );
   }

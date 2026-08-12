@@ -11,6 +11,7 @@ import '../data/inspection_storage_model.dart';
 import '../models/user_state.dart';
 import '../services/api_services.dart';
 import '../services/local_cache_service.dart';
+import '../services/notification_service.dart';
 
 part 'user_provider.g.dart';
 
@@ -102,6 +103,9 @@ class UserNotifier extends _$UserNotifier {
   }
 
   Future<void> clearUserData() async {
+    // Unregister the FCM token first — the DELETE is authenticated, so it must
+    // run before the JWT is wiped below. Best-effort; never blocks logout.
+    await NotificationService.unregisterToken();
     try {
       await _storage.deleteAll();
 

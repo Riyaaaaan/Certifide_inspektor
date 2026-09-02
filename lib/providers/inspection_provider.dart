@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:developer';
+import 'dart:io';
 
 import 'package:riverpod_annotation/riverpod_annotation.dart';
 
@@ -317,6 +318,36 @@ class InspectionNotifier extends _$InspectionNotifier {
       var container = await LocalStorageService.getMediaQueueById(id);
       if (container == null) return;
       final serverId = container.serverInspectionId;
+
+      // Drop entries whose file is genuinely gone BEFORE counting or selecting
+      // work. Such an entry can never upload, so leaving it queued retried it
+      // on every reconnect AND blocked its field's save-step forever — a field
+      // only replays once every one of its entries has uploaded, so one dead
+      // file held back the rest of that field's media indefinitely.
+      var droppedMissing = false;
+      for (final e in container.pendingMedia.entries.toList()) {
+        if (e.value.isUploaded) continue;
+        final resolved =
+            LocalStorageService.resolveMediaPath(e.value.localPath);
+        if (!File(resolved).existsSync()) {
+          log('Media queue: file missing for ${e.key} ($resolved); dropping.');
+          await LocalStorageService.removePendingMedia(id, e.key,
+              deleteLocalFile: false);
+          droppedMissing = true;
+        }
+      }
+      if (droppedMissing) {
+        // Dropping the last entry deletes the container outright.
+        final refreshed = await LocalStorageService.getMediaQueueById(id);
+        if (refreshed == null) {
+          _setMediaProgress(
+            id,
+            const MediaUploadProgress(total: 0, uploaded: 0, isUploading: false),
+          );
+          return;
+        }
+        container = refreshed;
+      }
 
       int total = container.pendingMedia.length;
       int uploaded = container.pendingMedia.values.where((m) => m.isUploaded).length;
@@ -666,54 +697,62 @@ class InspectionNotifier extends _$InspectionNotifier {
         );
       }
 
-      // Upload local videos, audios, and files
-      // Maps: localPath -> uploadedUrl (for in-data replacement)
+      // Upload local videos, audios, and files.
+      // Maps: fieldId -> uploadedUrl (for in-data replacement).
       final videoReplacements = <String, String>{};
       final audioReplacements = <String, String>{};
       final fileReplacements = <String, String>{};
 
+      // The endpoint rejects a blank `section` ("The section field is
+      // required."), so recover each field's section title from the stored
+      // body and skip any field we can't place rather than burning an upload
+      // on a request the server will refuse.
+      final sectionTitles = sectionTitlesByFieldId(currentInspection.data);
+      final rawId = currentInspection.data['inspection_id'];
+      final int? uploadInspectionId =
+          rawId is int ? rawId : int.tryParse(rawId?.toString() ?? '');
+
+      Future<String?> uploadMedia(
+          String path, String fieldId, String mediaType) async {
+        final section = sectionTitles[fieldId] ?? '';
+        if (section.isEmpty) {
+          log('Retry upload: no section for field $fieldId; skipping.');
+          return null;
+        }
+        final result = await ApiService.uploadImage(
+          path,
+          inspectionId: uploadInspectionId,
+          section: section,
+          itemId: fieldId,
+          fieldName: 'image',
+          mediaType: mediaType,
+        );
+        final url = result['url'] as String?;
+        if (result['success'] == true && url != null && url.isNotEmpty) {
+          return url;
+        }
+        log('Retry upload failed ($fieldId): ${result['message']}');
+        return null;
+      }
+
       for (var entry in currentInspection.videos.entries) {
         if (!entry.value.startsWith('http')) {
-          final result = await ApiService.uploadImage(
-            entry.value,
-            section: '',
-            itemId: entry.key,
-            fieldName: 'image',
-          );
-          final url = result['url'] as String?;
-          if (result['success'] == true && url != null && url.isNotEmpty) {
-            videoReplacements[entry.key] = url;
-          }
+          final url = await uploadMedia(entry.value, entry.key, 'video');
+          if (url != null) videoReplacements[entry.key] = url;
         }
       }
 
       for (var entry in currentInspection.audios.entries) {
         if (!entry.value.startsWith('http')) {
-          final result = await ApiService.uploadImage(
-            entry.value,
-            section: '',
-            itemId: entry.key,
-            fieldName: 'image',
-          );
-          final url = result['url'] as String?;
-          if (result['success'] == true && url != null && url.isNotEmpty) {
-            audioReplacements[entry.key] = url;
-          }
+          final url = await uploadMedia(entry.value, entry.key, 'audio');
+          if (url != null) audioReplacements[entry.key] = url;
         }
       }
 
       for (var entry in currentInspection.files.entries) {
         if (!entry.value.startsWith('http')) {
-          final result = await ApiService.uploadImage(
-            entry.value,
-            section: '',
-            itemId: entry.key,
-            fieldName: 'image',
-          );
-          final url = result['url'] as String?;
-          if (result['success'] == true && url != null && url.isNotEmpty) {
-            fileReplacements[entry.key] = url;
-          }
+          final url = await uploadMedia(entry.value, entry.key, 'file');
+          if (url != null) fileReplacements[entry.key] = url;
         }
       }
 
@@ -727,14 +766,8 @@ class InspectionNotifier extends _$InspectionNotifier {
             newList.add(p);
             continue;
           }
-          final result = await ApiService.uploadImage(
-            p,
-            section: '',
-            itemId: entry.key,
-            fieldName: 'image',
-          );
-          final url = result['url'] as String?;
-          if (result['success'] == true && url != null && url.isNotEmpty) {
+          final url = await uploadMedia(p, entry.key, 'multiImage');
+          if (url != null) {
             newList.add(url);
             changed = true;
           } else {
@@ -749,23 +782,14 @@ class InspectionNotifier extends _$InspectionNotifier {
           audioReplacements.isNotEmpty ||
           fileReplacements.isNotEmpty ||
           multiImageReplacements.isNotEmpty) {
+        // Keyed by field id, matching the maps above. Looking these up by local
+        // path instead silently produced empty maps, so a successful upload was
+        // discarded and the next retry re-sent the whole file.
         await LocalStorageService.updateInspectionMedia(
           inspectionId: inspection.id,
-          uploadedVideos: {
-            for (var e in currentInspection.videos.entries)
-              if (videoReplacements.containsKey(e.value))
-                e.key: videoReplacements[e.value]!,
-          },
-          uploadedAudios: {
-            for (var e in currentInspection.audios.entries)
-              if (audioReplacements.containsKey(e.value))
-                e.key: audioReplacements[e.value]!,
-          },
-          uploadedFiles: {
-            for (var e in currentInspection.files.entries)
-              if (fileReplacements.containsKey(e.value))
-                e.key: fileReplacements[e.value]!,
-          },
+          uploadedVideos: videoReplacements,
+          uploadedAudios: audioReplacements,
+          uploadedFiles: fileReplacements,
           uploadedMultiImages: multiImageReplacements,
         );
       }
@@ -900,6 +924,37 @@ class InspectionNotifier extends _$InspectionNotifier {
     state = state.copyWith(isDirty: true);
   }
 
+}
+
+/// Maps every field id in a stored submission body to its section *title*.
+///
+/// The upload endpoint validates `section` as `required|string`, and the
+/// per-field media maps ([LocalInspection.videos] and friends) only carry the
+/// field id — the section is recoverable solely from the stored body, whose
+/// `inspection_data` holds `{sectionSlug: {title, items:[{id, ...}]}}`.
+/// Field id and unique id are the same value in both item shapes, so an item's
+/// `id` is what the endpoint wants as `itemId`.
+///
+/// Tolerates a partial or malformed body by omitting whatever it can't read:
+/// callers skip fields with no section rather than sending a request the
+/// server will reject.
+Map<String, String> sectionTitlesByFieldId(Map<String, dynamic> data) {
+  final titles = <String, String>{};
+  final inspData = data['inspection_data'];
+  if (inspData is! Map) return titles;
+  for (final section in inspData.values) {
+    if (section is! Map) continue;
+    final title = section['title']?.toString() ?? '';
+    if (title.isEmpty) continue;
+    final items = section['items'];
+    if (items is! List) continue;
+    for (final item in items) {
+      if (item is Map && item['id'] != null) {
+        titles[item['id'].toString()] = title;
+      }
+    }
+  }
+  return titles;
 }
 
 /// Recursively deep-copies a JSON-shaped value (Maps and Lists). Primitives

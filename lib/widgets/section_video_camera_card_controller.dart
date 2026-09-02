@@ -11,6 +11,32 @@ import 'section_camera_card.dart'
 
 part 'section_video_camera_card_controller.g.dart';
 
+/// Capture resolution for inspection video: 1080p, not the sensor maximum.
+///
+/// [ResolutionPreset.max] records at whatever the sensor offers — 4K at 40-60
+/// Mbps on a current phone, so ~7 MB per second with no duration cap. The
+/// upload path reads the whole file into memory before sending
+/// (`ApiService.uploadImage`), so a long 4K clip gets the app OOM-killed
+/// mid-upload and the video silently never arrives.
+///
+/// 1080p is 4-9x smaller and still resolves the detail an inspection needs:
+/// panel scratches, tyre wear, VIN and odometer plates.
+const ResolutionPreset _videoResolution = ResolutionPreset.veryHigh;
+
+/// Hard stop for a single recording.
+///
+/// Recording was previously unbounded, so a button left held produced a file
+/// that took minutes to send over mobile data — and a transfer cut off
+/// mid-flight is rejected as a partial upload, which is what the server logged
+/// as "The image failed to upload."
+///
+/// The binding constraint is transfer reliability, NOT the server's size rule
+/// (1 GB, far above anything recorded here). Sized against what has actually
+/// been observed to complete: the largest video that ever landed on the server
+/// was ~173 MB. At 1080p h264's ~12 Mbps peak, two minutes is ~180 MB, which
+/// keeps a full-length clip inside that proven range.
+const Duration maxRecordingDuration = Duration(minutes: 2);
+
 /// Immutable, rebuild-driving slice of a video camera card's state. Hardware
 /// handles (the [CameraController], timers, generation counters) live on the
 /// notifier itself — only the fields the UI renders belong here.
@@ -271,7 +297,7 @@ class VideoCardController extends _$VideoCardController
 
     final controller = CameraController(
       camera,
-      ResolutionPreset.max,
+      _videoResolution,
       enableAudio: true,
     );
     _controller = controller;
@@ -372,7 +398,13 @@ class VideoCardController extends _$VideoCardController
     _timer?.cancel();
     if (reset) _set(state.copyWith(elapsed: Duration.zero));
     _timer = Timer.periodic(const Duration(seconds: 1), (_) {
-      _set(state.copyWith(elapsed: state.elapsed + const Duration(seconds: 1)));
+      final elapsed = state.elapsed + const Duration(seconds: 1);
+      _set(state.copyWith(elapsed: elapsed));
+      if (elapsed >= maxRecordingDuration) {
+        _onNotice?.call(
+            'Maximum recording length reached (${maxRecordingDuration.inMinutes} min).');
+        unawaited(_stopRecording());
+      }
     });
   }
 

@@ -34,6 +34,21 @@ class ApiService {
   static const String baseUrl = 'https://api.certifide.in/api';
   static const Duration _requestTimeout = Duration(seconds: 30);
 
+  /// Media uploads get their own, far longer budget: an inspection video over
+  /// mobile data legitimately runs for minutes, so [_requestTimeout] would
+  /// abort healthy transfers. It still needs a ceiling — without one, a stalled
+  /// socket leaves the submit spinner up forever with no way out.
+  static const Duration _uploadTimeout = Duration(minutes: 10);
+
+  /// Refuse anything above this locally rather than spending the whole upload
+  /// to earn a rejection. Tracks the server's `max:1048576` rule (1 GB) on the
+  /// upload endpoint, so the app never blocks a file the server would accept.
+  ///
+  /// This is the hard ceiling, not a target: see `maxRecordingDuration`, which
+  /// keeps clips the app records itself far below it, because transfer
+  /// reliability — not the server rule — is what actually fails first.
+  static const int maxUploadBytes = 1048576 * 1024;
+
   static const _storage = FlutterSecureStorage();
 
   static const String loginEndpoint = '/auth/login';
@@ -44,6 +59,18 @@ class ApiService {
   static const String allocateTokensEndPoint = '/tokens/allocate';
   static const String sendDataEndPoint = '/inspections';
   static const String uploadImageEndPoint = '/inspection/upload-image';
+
+  /// Dedicated video upload. Unlike [uploadImageEndPoint] this route sits
+  /// inside the server's `jwt.auth` middleware group, so the bearer token is
+  /// actually enforced. Takes the file under the field name `video` and
+  /// answers with a `videoPath` key instead of `imagePath`.
+  static const String uploadVideoEndPoint = '/dynamic-inspections/upload-video';
+
+  /// Formats [uploadVideoEndPoint] accepts. Narrower than the legacy route's
+  /// list (no 3gp), so anything outside it must keep using the old endpoint.
+  static const Set<String> videoEndpointExtensions = {
+    'mp4', 'avi', 'mov', 'wmv', 'flv', 'webm', 'mkv',
+  };
   static const String getBalanceTokensEndPoint = '/tokens/balance';
   static const String getHistoryEndPoint = '/dynamic-inspections';
   static const String initialInspectionEndPoint = '/inspections/initial';
@@ -648,7 +675,7 @@ class ApiService {
     String? mediaType,
   }) async {
     try {
-      log('Uploading media (${mediaType ?? fieldName}) to: $baseUrl$uploadImageEndPoint');
+      log('Uploading media (${mediaType ?? fieldName})');
       log('Section: $section, ItemId: $itemId');
 
       // Re-base any stale absolute path (captured under a previous iOS sandbox
@@ -665,10 +692,43 @@ class ApiService {
         };
       }
 
-      final bytes = await file.readAsBytes();
+      // Stat the file instead of reading it. A full-resolution inspection video
+      // is hundreds of MB; buffering it here (readAsBytes) got the app
+      // OOM-killed mid-upload and the media silently never arrived.
+      final fileLength = await file.length();
       final fileName = imagePath.split('/').last;
 
-      log('File name: $fileName, size: ${bytes.length} bytes');
+      log('File name: $fileName, size: $fileLength bytes');
+
+      if (fileLength > maxUploadBytes) {
+        final mb = (fileLength / (1024 * 1024)).toStringAsFixed(1);
+        log('File exceeds upload limit: $mb MB');
+        return {
+          'success': false,
+          'message': 'File is too large to upload ($mb MB). '
+              'Please recapture a shorter clip.',
+        };
+      }
+
+      // Prefer the dedicated, authenticated video endpoint. The legacy
+      // /inspection/upload-image route sits OUTSIDE the jwt.auth middleware
+      // group, so the server never checks the token this app already sends.
+      //
+      // Only when the request actually satisfies that endpoint's stricter
+      // contract, which the legacy one no longer enforces: it requires a
+      // non-empty section and itemId, and accepts a narrower format list.
+      // Falling back keeps an odd file uploading instead of hard-failing it.
+      final useVideoEndpoint = usesVideoEndpoint(
+        mediaType: mediaType,
+        section: section,
+        itemId: itemId,
+        fileName: fileName,
+      );
+
+      final endpoint =
+          useVideoEndpoint ? uploadVideoEndPoint : uploadImageEndPoint;
+      final uploadField = useVideoEndpoint ? 'video' : fieldName;
+      if (useVideoEndpoint) log('Routing video to $uploadVideoEndPoint');
 
       final token = await _storage.read(key: 'jwt_token');
       if (token == null) {
@@ -698,20 +758,24 @@ class ApiService {
         }
         final request = http.MultipartRequest(
           'POST',
-          Uri.parse('$baseUrl$uploadImageEndPoint'),
+          Uri.parse('$baseUrl$endpoint'),
         );
         request.headers['Authorization'] = 'Bearer $authToken';
         request.headers['Accept'] = 'application/json';
+        // Streams from disk at constant memory. Built fresh on every attempt
+        // because a stream, unlike a byte list, cannot be replayed on retry.
         request.files.add(
-          http.MultipartFile.fromBytes(fieldName, bytes, filename: fileName),
+          await http.MultipartFile.fromPath(uploadField, imagePath,
+              filename: fileName),
         );
         request.fields['section'] = section;
         request.fields['itemId'] = itemId;
         if (inspectionId != null) {
           request.fields['inspection_id'] = inspectionId.toString();
         }
-        final response = await request.send();
-        final body = await response.stream.bytesToString();
+        final response = await request.send().timeout(_uploadTimeout);
+        final body =
+            await response.stream.bytesToString().timeout(_uploadTimeout);
         return (status: response.statusCode, body: body);
       }
 
@@ -762,11 +826,20 @@ class ApiService {
                 responseData['success'] == true);
 
         if (ok) {
-          final String? url = mediaPath is Map
-              ? mediaPath['url']?.toString()
+          // Prefer the `url` half of {url, path}. Fall back to `path` (or to a
+          // bare string response) ONLY through absoluteMediaUrl: a relative
+          // path stored here is dropped by the http-only filter when the
+          // inspection is submitted, so the upload would succeed and the media
+          // would then silently vanish from the report.
+          final String? rawUrl = mediaPath is Map
+              ? (mediaPath['url'] ?? mediaPath['path'])?.toString()
               : mediaPath.toString();
+          final String? url = absoluteMediaUrl(rawUrl);
           final String? path =
               mediaPath is Map ? mediaPath['path']?.toString() : null;
+          if (rawUrl != url) {
+            log('Upload returned a relative media path; resolved to $url');
+          }
           log('Upload successful. URL: $url');
           return {
             'success': true,
@@ -793,6 +866,12 @@ class ApiService {
           'message': _handleErrorFromString(result.body, result.status),
         };
       }
+    } on TimeoutException {
+      log('Media upload timed out after $_uploadTimeout');
+      return {
+        'success': false,
+        'message': 'The upload timed out. Check your connection and try again.',
+      };
     } catch (e) {
       log('Error uploading media: $e');
       return {
@@ -805,14 +884,88 @@ class ApiService {
   static String _handleErrorFromString(String responseBody, int statusCode) {
     try {
       final errorData = json.decode(responseBody);
+      // A 422 carries the useful detail in `errors`, keyed by field; `message`
+      // is only ever the generic "Validation failed". Prefer the specifics.
+      final errors = errorData['errors'];
+      if (errors is Map && errors.isNotEmpty) {
+        final detail = errors.values
+            .expand((v) => v is List ? v : [v])
+            .map((v) => v.toString())
+            .where((v) => v.isNotEmpty)
+            .join(' ');
+        if (detail.isNotEmpty) return detail;
+      }
       if (errorData['message'] != null) {
         return errorData['message'];
       } else if (errorData['error'] != null) {
         return errorData['error'];
       }
-      return 'An error occurred ($statusCode)';
+      return uploadStatusMessage(statusCode);
     } catch (e) {
-      return 'An error occurred ($statusCode)';
+      // A rejection from the web server rather than the app returns an HTML
+      // error page, so there is no JSON message to surface. Translate the
+      // status instead of showing a bare code the inspector can't act on.
+      return uploadStatusMessage(statusCode);
+    }
+  }
+
+  /// Whether this upload should go to the authenticated [uploadVideoEndPoint]
+  /// rather than the unauthenticated legacy route.
+  ///
+  /// That endpoint enforces a stricter contract than the legacy one, which now
+  /// accepts a null section/itemId: it requires BOTH to be non-empty and takes
+  /// a narrower format list. Anything failing those conditions keeps using the
+  /// legacy route, so a request that would 422 there uploads instead of being
+  /// hard-rejected — availability first, since the legacy path still works.
+  static bool usesVideoEndpoint({
+    required String? mediaType,
+    required String section,
+    required String itemId,
+    required String fileName,
+  }) {
+    if (mediaType != 'video') return false;
+    if (section.trim().isEmpty || itemId.trim().isEmpty) return false;
+    final extension =
+        fileName.contains('.') ? fileName.split('.').last.toLowerCase() : '';
+    return videoEndpointExtensions.contains(extension);
+  }
+
+  /// Turns whatever the upload endpoint returned into an absolute URL.
+  ///
+  /// The server normally returns `{url, path}` and the `url` half is already
+  /// absolute. But a bare `inspections/...` string — from the `path` half, an
+  /// older build, or a plain-string response — is NOT usable downstream: the
+  /// submission body is built with an http-only filter, so a relative value is
+  /// stripped and the media disappears from the report even though the upload
+  /// succeeded. Resolving it against the API origin keeps that from happening.
+  ///
+  /// Returns null for null/empty input so callers still treat it as a failure.
+  static String? absoluteMediaUrl(String? raw) {
+    final value = raw?.trim();
+    if (value == null || value.isEmpty) return null;
+    if (value.startsWith('http://') || value.startsWith('https://')) {
+      return value;
+    }
+    // baseUrl carries the `/api` suffix; media is served from the host root.
+    final origin = Uri.parse(baseUrl).origin;
+    return '$origin/${value.replaceFirst(RegExp(r'^/+'), '')}';
+  }
+
+  /// Plain-language text for the upload failures that arrive without a usable
+  /// JSON body.
+  static String uploadStatusMessage(int statusCode) {
+    switch (statusCode) {
+      case 413:
+        return 'File is too large for the server to accept. '
+            'Please recapture a shorter clip.';
+      case 408:
+      case 504:
+        return 'The upload timed out. Check your connection and try again.';
+      case 502:
+      case 503:
+        return 'The server is temporarily unavailable. Please try again.';
+      default:
+        return 'An error occurred ($statusCode)';
     }
   }
 

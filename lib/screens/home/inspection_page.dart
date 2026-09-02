@@ -86,6 +86,20 @@ Map<String, dynamic> _buildStoragePayload(Map<String, dynamic> input) {
   };
 }
 
+/// One field whose media could not be uploaded, paired with the reason the
+/// server or the network gave.
+///
+/// The reason is what makes the failure sheet actionable: "too large" needs a
+/// shorter recapture, "timed out" needs a better connection, and a validation
+/// message needs a bug report. Reporting only the field name left the inspector
+/// retrying the same doomed submit.
+class MediaUploadFailure {
+  final String field;
+  final String reason;
+
+  const MediaUploadFailure(this.field, this.reason);
+}
+
 class InspectionScreen extends ConsumerStatefulWidget {
   final bool isNewInspection;
   final Map<String, dynamic>? vehicleDetails;
@@ -860,13 +874,19 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
       try {
         final hasInternet = await ConnectivityChecker.canReachServer();
         if (!hasInternet) return;
-        await ApiService.saveInspectionStep(
+        final result = await ApiService.saveInspectionStep(
           inspectionId,
           section: capturedSection,
           items: [singleItem],
         );
+        // The result used to be discarded, so a rejected save-step (validation
+        // error, expired session, 5xx) left no trace at all — the answer looked
+        // saved and simply was not. Only exceptions were ever logged.
+        if (result['success'] == false) {
+          log('Per-field save rejected ($uniqueId): ${result['message']}');
+        }
       } catch (e) {
-        log('Per-field save error: $e');
+        log('Per-field save error ($uniqueId): $e');
       }
     }));
   }
@@ -3523,10 +3543,7 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
       if (sectionTitle.isNotEmpty) break;
     }
 
-    final savedPath = await LocalStorageService.saveVideo(
-      file.path,
-      rotateAngle: quarterTurns * 90,
-    );
+    final savedPath = await LocalStorageService.saveVideo(file.path);
 
     unawaited(LocalStorageService.saveMediaToUserStorage(
       savedPath,
@@ -3547,6 +3564,7 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
     await _saveDataLocally();
 
     final bool hasInternet = await ConnectivityChecker.canReachServer();
+    bool uploaded = false;
     if (hasInternet && sectionTitle.isNotEmpty) {
       final result = await ApiService.uploadImage(
         savedPath,
@@ -3554,24 +3572,36 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
         section: sectionTitle,
         itemId: fieldId,
         fieldName: 'image',
+        mediaType: 'video',
       );
+      final url = result['url']?.toString();
+      uploaded = result['success'] == true && url != null && url.isNotEmpty;
+      if (uploaded) {
+        // Record the URL even if the page unmounted mid-upload, so a successful
+        // upload is never lost to a navigation race.
+        itemVideos[uniqueId] = url;
+        await _saveDataLocally();
+        try { await File(savedPath).delete(); } catch (_) {}
+      } else {
+        log('Video upload failed ($uniqueId): ${result['message']}');
+      }
       if (mounted) {
         _unmarkUploading(uniqueId);
-        final url = result['url']?.toString();
-        if (result['success'] == true && url != null && url.isNotEmpty) {
-          setState(() => itemVideos[uniqueId] = url);
-          await _saveDataLocally();
-          try { await File(savedPath).delete(); } catch (_) {}
+        if (uploaded) {
+          setState(() {});
           _saveFieldToServer(foundItem, uniqueId);
         }
       }
     } else {
       if (mounted) _unmarkUploading(uniqueId);
-      // Offline: commit this media to the durable upload queue immediately so a
-      // hard kill before the next background/close still leaves it queued for
-      // upload and recoverable on resume (see _rehydratePendingMediaFromQueue).
-      unawaited(_commitPendingMediaToQueue());
     }
+
+    // Anything still local — offline, no section, or a failed upload — goes to
+    // the durable queue now, so a hard kill before the next background/close
+    // still leaves it queued for upload and recoverable on resume (see
+    // _rehydratePendingMediaFromQueue). Previously only the offline branch did
+    // this, so a capture-time upload failure left the video unqueued.
+    if (!uploaded) unawaited(_commitPendingMediaToQueue());
   }
 
   Future<void> _acceptCapturedAudio() async {
@@ -4252,8 +4282,9 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
 
   /// Shown when one or more media uploads fail during submission, so the user
   /// can retry instead of the field silently arriving empty on the server.
-  void _showUploadFailedSheet(List<String> fields) {
-    log('Submission blocked - ${fields.length} media upload(s) failed: $fields');
+  void _showUploadFailedSheet(List<MediaUploadFailure> fields) {
+    log('Submission blocked - ${fields.length} media upload(s) failed: '
+        '${fields.map((f) => "${f.field} (${f.reason})").join(", ")}');
     showModalBottomSheet(
       context: context,
       isScrollControlled: true,
@@ -4310,7 +4341,7 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
                             ),
                             const SizedBox(height: 2),
                             Text(
-                              '${fields.length} ${fields.length == 1 ? "item" : "items"} failed to upload. Check your connection and submit again.',
+                              '${fields.length} ${fields.length == 1 ? "item" : "items"} failed to upload. See why below, then submit again.',
                               style: const TextStyle(
                                 fontSize: 13,
                                 color: Color(0xFF6B7280),
@@ -4329,14 +4360,17 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
                     shrinkWrap: true,
                     itemCount: fields.length,
                     itemBuilder: (context, index) {
+                      final failure = fields[index];
                       return Padding(
                         padding: const EdgeInsets.symmetric(
                             horizontal: 20, vertical: 12),
                         child: Row(
+                          crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
                             Container(
                               width: 6,
                               height: 6,
+                              margin: const EdgeInsets.only(top: 7),
                               decoration: const BoxDecoration(
                                 color: Color(0xFFDC2626),
                                 shape: BoxShape.circle,
@@ -4344,12 +4378,25 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
                             ),
                             const SizedBox(width: 12),
                             Expanded(
-                              child: Text(
-                                fields[index],
-                                style: const TextStyle(
-                                  fontSize: 15,
-                                  color: Color(0xFF111827),
-                                ),
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(
+                                    failure.field,
+                                    style: const TextStyle(
+                                      fontSize: 15,
+                                      color: Color(0xFF111827),
+                                    ),
+                                  ),
+                                  const SizedBox(height: 2),
+                                  Text(
+                                    failure.reason,
+                                    style: const TextStyle(
+                                      fontSize: 13,
+                                      color: Color(0xFF6B7280),
+                                    ),
+                                  ),
+                                ],
                               ),
                             ),
                           ],
@@ -4570,13 +4617,18 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
   /// mid-run; the setState only repaints. Returns the list of field titles whose
   /// upload failed so the caller can block submission instead of silently POSTing
   /// a local path the server can't resolve.
-  Future<List<String>> _uploadRemainingImages() async {
-    final failed = <String>[];
+  Future<List<MediaUploadFailure>> _uploadRemainingImages() async {
+    final failed = <MediaUploadFailure>[];
 
-    void markFailed(dynamic item) {
+    void markFailed(dynamic item, Map<String, dynamic> result) {
       final title = _getItemTitle(item);
       final label = title.isNotEmpty ? title : _getItemFieldId(item);
-      if (label.isNotEmpty && !failed.contains(label)) failed.add(label);
+      if (label.isEmpty) return;
+      if (failed.any((f) => f.field == label)) return;
+      final reason =
+          result['message']?.toString().trim() ?? 'Upload failed. Try again.';
+      failed.add(MediaUploadFailure(
+          label, reason.isEmpty ? 'Upload failed. Try again.' : reason));
     }
 
     for (var section in _sections) {
@@ -4598,7 +4650,7 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
           if (result['success'] == true && url != null && url.isNotEmpty) {
             itemImages[uniqueId] = url;
           } else {
-            markFailed(item);
+            markFailed(item, result);
           }
           if (mounted) setState(() => _unmarkUploading(uniqueId));
         }
@@ -4619,7 +4671,7 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
                 updated.add(url);
               } else {
                 updated.add(path);
-                markFailed(item);
+                markFailed(item, result);
               }
             } else {
               updated.add(path);
@@ -4638,12 +4690,13 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
             section: sectionTitle,
             itemId: fieldId,
             fieldName: 'image',
+            mediaType: 'video',
           );
           final url = result['url']?.toString();
           if (result['success'] == true && url != null && url.isNotEmpty) {
             itemVideos[uniqueId] = url;
           } else {
-            markFailed(item);
+            markFailed(item, result);
           }
           if (mounted) setState(() => _unmarkUploading(uniqueId));
         }
@@ -4662,7 +4715,7 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
           if (result['success'] == true && url != null && url.isNotEmpty) {
             itemAudios[uniqueId] = url;
           } else {
-            markFailed(item);
+            markFailed(item, result);
           }
           if (mounted) setState(() => _unmarkUploading(uniqueId));
         }
@@ -4700,7 +4753,7 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
                 'fileType': fileType ?? '',
               });
             } else {
-              markFailed(item);
+              markFailed(item, result);
             }
             if (mounted) setState(() => _unmarkUploading(uniqueId));
           }
@@ -4711,8 +4764,80 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
     return failed;
   }
 
+  /// Saves the in-progress inspection as an offline record so a submit that
+  /// did not land can be retried later.
+  ///
+  /// Called from BOTH the rejected-response path and the exception path — an
+  /// exception is exactly when durability matters most, and skipping it there
+  /// left the work with nothing backing it.
+  Future<void> _persistSubmissionForRetry() async {
+    final finalItemImages = Map<String, String?>.from(itemImages);
+    final finalItemVideos = Map<String, String?>.from(itemVideos);
+    final finalItemAudios = Map<String, String?>.from(itemAudios);
+    final finalItemFiles = Map<String, String?>.from(itemFiles);
+    final finalMultiImages = <String, List<String>>{};
+    itemMultiImages.forEach((key, value) {
+      if (value != null && value.isNotEmpty) finalMultiImages[key] = value;
+    });
+
+    // Section/fieldId per image so the offline upload can route it later.
+    final imageMetadata = <String, dynamic>{};
+    for (final section in _sections) {
+      final sectionTitle = section['title'] as String;
+      for (final item in section['items'] as List<dynamic>) {
+        final uniqueId = _getItemUniqueId(item);
+        if (finalItemImages[uniqueId] != null) {
+          imageMetadata[uniqueId] = {
+            'section': sectionTitle,
+            'itemId': _getItemFieldId(item),
+          };
+        }
+      }
+    }
+
+    await LocalStorageService.saveInspection(
+      data: _buildSubmissionBody(),
+      images: finalItemImages,
+      imageMetadata: imageMetadata,
+      status: 'offline',
+      videos: finalItemVideos,
+      audios: finalItemAudios,
+      files: finalItemFiles,
+      multiImages: finalMultiImages,
+    );
+
+    // Keep the files. saveInspection copied them into the offline record, but
+    // this screen stays open on a failed submit and its in-memory maps (and the
+    // working copy) still point at the ORIGINAL paths. Deleting them here left
+    // a retry uploading a file that no longer existed — "File not found"
+    // forever, including after resume.
+    final sid = _effectiveInspectionId;
+    if (sid != null) {
+      await LocalStorageService.clearMediaQueueFor(sid,
+          deleteLocalFiles: false);
+    }
+  }
+
   Future<void> _handleSubmission() async {
     if (_isSubmitting) return;
+
+    // Wait for capture-time uploads still in flight. Without this the submit
+    // and an in-progress upload of the same file run concurrently: the field
+    // still holds a local path, so _uploadRemainingImages starts a SECOND
+    // upload of it. A video takes minutes where a photo takes seconds, so the
+    // window is wide. Once an inspection is completed the server rejects
+    // further writes, which would orphan the late file permanently.
+    if (_uploadingImages.value.isNotEmpty) {
+      final count = _uploadingImages.value.length;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(count == 1
+              ? 'Still uploading 1 file. Please wait a moment.'
+              : 'Still uploading $count files. Please wait a moment.'),
+        ),
+      );
+      return;
+    }
 
     // Block submission until every required field across all sections is filled.
     final missingGroups = _getGroupedRequiredFieldErrors();
@@ -4818,7 +4943,7 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
         log(body.toString());
         log(result.toString());
 
-        if (result['success']) {
+        if (result['success'] == true) {
           final sid = _effectiveInspectionId;
           if (sid != null) {
             await LocalStorageService.clearMediaQueueFor(sid);
@@ -4841,9 +4966,21 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
           await _cleanupCurrentInspection();
 
           if (mounted) {
-            final data = result['data'] as Map<String, dynamic>;
-            final redirectUrl = data['redirect_url'] as String? ?? '';
-            final inspectionId = data['inspection_id'] as int? ?? 0;
+            // Read defensively. This runs AFTER the queue and local media
+            // have been deleted, so a hard cast here turned a submit that had
+            // already succeeded server-side into an error snackbar with no way
+            // back. Missing fields degrade to the success page without a
+            // report link instead of throwing.
+            final data = result['data'];
+            final Map<String, dynamic> payload =
+                data is Map<String, dynamic> ? data : const {};
+            if (data != null && data is! Map<String, dynamic>) {
+              log('Submit succeeded but `data` was ${data.runtimeType}');
+            }
+            final redirectUrl = payload['redirect_url']?.toString() ?? '';
+            final inspectionId = payload['inspection_id'] is int
+                ? payload['inspection_id'] as int
+                : int.tryParse(payload['inspection_id']?.toString() ?? '') ?? 0;
             if (redirectUrl.isNotEmpty) {
               await ReportsCacheService.addReport(
                 redirectUrl: redirectUrl,
@@ -4855,53 +4992,14 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
                 builder: (context) => InspectionSuccessPage(
                   redirectUrl: redirectUrl,
                   inspectionId: inspectionId,
-                  uuid: data['uuid'] ?? '',
+                  uuid: payload['uuid']?.toString() ?? '',
                 ),
               ),
               (route) => false,
             );
           }
         } else {
-          Map<String, String?> finalItemImages = Map.from(itemImages);
-          Map<String, String?> finalItemVideos = Map.from(itemVideos);
-          Map<String, String?> finalItemAudios = Map.from(itemAudios);
-          Map<String, String?> finalItemFiles = Map.from(itemFiles);
-          // Filter out null values from multiImages
-          Map<String, List<String>> finalMultiImages = {};
-          itemMultiImages.forEach((key, value) {
-            if (value != null && value.isNotEmpty) {
-              finalMultiImages[key] = value;
-            }
-          });
-
-          final imageMetadata = <String, dynamic>{};
-          for (final section in _sections) {
-            final sectionTitle = section['title'] as String;
-            for (final item in section['items'] as List<dynamic>) {
-              final uniqueId = _getItemUniqueId(item);
-              if (finalItemImages[uniqueId] != null) {
-                imageMetadata[uniqueId] = {
-                  'section': sectionTitle,
-                  'itemId': _getItemFieldId(item),
-                };
-              }
-            }
-          }
-
-          await LocalStorageService.saveInspection(
-            data: _buildSubmissionBody(),
-            images: finalItemImages,
-            imageMetadata: imageMetadata,
-            status: 'offline',
-            videos: finalItemVideos,
-            audios: finalItemAudios,
-            files: finalItemFiles,
-            multiImages: finalMultiImages,
-          );
-          final sidFailed = _effectiveInspectionId;
-          if (sidFailed != null) {
-            await LocalStorageService.clearMediaQueueFor(sidFailed);
-          }
+          await _persistSubmissionForRetry();
           if (mounted) {
             ref.read(inspectionProvider.notifier).markDirty();
             ScaffoldMessenger.of(context).showSnackBar(
@@ -4910,9 +5008,23 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
           }
         }
       } catch (apiError) {
+        // A THROW here used to only show a snackbar, leaving the inspection
+        // saved nowhere: the rejected-response branch above persists it for
+        // retry, but an exception skipped that entirely and the inspector's
+        // work sat in memory with no queue entry behind it. Persist on both.
+        log('Submission threw: $apiError');
+        try {
+          await _persistSubmissionForRetry();
+        } catch (e) {
+          log('Could not persist inspection after submission error: $e');
+        }
         if (mounted) {
+          ref.read(inspectionProvider.notifier).markDirty();
           ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text('Submission error: $apiError')),
+            SnackBar(
+              content: Text('Submission error: $apiError. '
+                  'Saved to pending — it will retry automatically.'),
+            ),
           );
         }
       }

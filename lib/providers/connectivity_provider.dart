@@ -32,6 +32,10 @@ class ConnectivityStatus extends _$ConnectivityStatus {
 
   Future<void> _start() async {
     await _probe();
+    // The probe is a DNS lookup with a 3s timeout; the provider can be disposed
+    // while it runs. onDispose has already cancelled a still-null subscription
+    // by then, so subscribing now would leak a listener nothing ever cancels.
+    if (!ref.mounted) return;
     _subscription =
         Connectivity().onConnectivityChanged.listen((results) {
       final hasInterface =
@@ -54,12 +58,17 @@ class ConnectivityStatus extends _$ConnectivityStatus {
   }
 
   void _set(bool online) {
+    // Reading or writing `state` after disposal throws. Every caller arrives
+    // here across an async gap (the DNS probe) or from a debounce timer, so the
+    // provider may already be gone.
+    if (!ref.mounted) return;
     if (state != online) state = online;
   }
 
   /// Imperative re-check (e.g. from a "Retry" button). Returns the fresh state.
   Future<bool> refresh() async {
     await _probe();
-    return state;
+    // Assume reachable if we were disposed mid-probe; the value is unused then.
+    return ref.mounted ? state : true;
   }
 }

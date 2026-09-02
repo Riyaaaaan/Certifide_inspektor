@@ -275,9 +275,12 @@ class _SectionCameraCardState extends State<SectionCameraCard>
 
     if (!mounted) return false;
 
+    // Stills are downscaled to 1920px and re-encoded at quality 85 before they
+    // are stored (LocalStorageService.saveImage), so capturing at the sensor
+    // maximum only buys a larger bitmap to allocate and throw away.
     final controller = CameraController(
       camera,
-      ResolutionPreset.max,
+      ResolutionPreset.veryHigh,
       enableAudio: false,
       imageFormatGroup: ImageFormatGroup.jpeg,
     );

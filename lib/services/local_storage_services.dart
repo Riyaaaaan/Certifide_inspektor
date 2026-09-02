@@ -222,7 +222,14 @@ class LocalStorageService {
     }
   }
 
-  static Future<String> saveVideo(String filePath, {int rotateAngle = 0}) async {
+  /// Copies a captured video into app storage and returns the new path.
+  ///
+  /// Deliberately does NOT rotate: re-encoding video needs a transcoder this
+  /// app doesn't ship, and the previous `rotateAngle` parameter was accepted
+  /// and then ignored, so a rotation chosen in the review screen looked applied
+  /// but never reached the file or the server. Callers keep the angle in
+  /// `itemVideoRotations` for local playback only.
+  static Future<String> saveVideo(String filePath) async {
     try {
       final File videoFile = File(filePath);
       if (!videoFile.existsSync()) throw Exception('File not found');

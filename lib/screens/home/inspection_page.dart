@@ -20,6 +20,8 @@ import '../../constants/hive_constants.dart';
 import '../../data/inspection_storage_model.dart';
 import '../../services/reference_media_cache.dart';
 import '../../models/inspection_item.dart';
+import '../../models/inspection_state.dart';
+import '../../utils/upload_display.dart';
 import '../../models/inspection_template_model.dart';
 import '../../models/pending_media.dart';
 import '../../providers/inspection_provider.dart';
@@ -169,6 +171,17 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
   // ValueNotifier so upload spinners rebuild only their own widget (via
   // ValueListenableBuilder), not the whole screen, on add/remove.
   final ValueNotifier<Set<String>> _uploadingImages = ValueNotifier(<String>{});
+
+  /// Byte progress for the field currently uploading, keyed by uniqueId. Kept
+  /// in a ValueNotifier rather than setState so a video streaming for two
+  /// minutes repaints one badge instead of the whole form.
+  final ValueNotifier<Map<String, MediaFileProgress>> _uploadProgress =
+      ValueNotifier(const {});
+
+  /// Last published sample per field, for deriving a rate and for throttling.
+  final Map<String, ({DateTime at, int sent})> _uploadSamples = {};
+
+  static const Duration _uploadProgressFrame = Duration(milliseconds: 400);
   final Set<String> _uploadingMultiImagePaths = {};
   String? _verifyingRegNoUniqueId;
   final Map<String, String> _regNoVerifyMessage = {};
@@ -2268,6 +2281,8 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
                     inspectionId: _effectiveInspectionId,
                     section: sectionTitle,
                     itemId: fieldId,
+                    onProgress: (sent, total) =>
+                        _onUploadProgress(uniqueId, sent, total),
                   );
                   if (mounted) {
                     _unmarkUploading(uniqueId);
@@ -2277,6 +2292,8 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
                       await _saveDataLocally();
                       try { await File(savedPath).delete(); } catch (_) {}
                       _saveFieldToServer(item, uniqueId);
+                    } else {
+                      _showUploadFailedSnack(result);
                     }
                   }
                 } else {
@@ -2332,21 +2349,25 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
                           if (!uploading.contains(uniqueId)) {
                             return const SizedBox.shrink();
                           }
-                          return const Row(
+                          return Row(
                             mainAxisSize: MainAxisSize.min,
                             children: [
-                              SizedBox(width: 8),
-                              SizedBox(
+                              const SizedBox(width: 8),
+                              const SizedBox(
                                 width: 14,
                                 height: 14,
                                 child:
                                     CircularProgressIndicator(strokeWidth: 2),
                               ),
-                              SizedBox(width: 4),
-                              Text(
-                                'Uploading...',
-                                style: TextStyle(
-                                    fontSize: 11, color: Colors.orange),
+                              const SizedBox(width: 4),
+                              ValueListenableBuilder<
+                                  Map<String, MediaFileProgress>>(
+                                valueListenable: _uploadProgress,
+                                builder: (context, progress, _) => Text(
+                                  uploadBadgeLabel(progress[uniqueId]),
+                                  style: const TextStyle(
+                                      fontSize: 11, color: Colors.orange),
+                                ),
                               ),
                             ],
                           );
@@ -3008,6 +3029,8 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
             inspectionId: _effectiveInspectionId,
             section: sectionTitle,
             itemId: fieldId,
+            onProgress: (sent, total) =>
+                _onUploadProgress(uniqueId, sent, total),
           );
 
           if (mounted) {
@@ -3024,11 +3047,9 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
               try { await File(savedPath).delete(); } catch (_) {}
               _saveFieldToServer(item, uniqueId);
             } else {
-              ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(
-                    content:
-                        Text('Image saved locally. Will upload when online.')),
-              );
+              // Was "will upload when online" for every failure, which is a
+              // lie when the server rejected the file outright.
+              _showUploadFailedSnack(result);
             }
           }
         } else {
@@ -3365,6 +3386,60 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
     }
   }
 
+  /// Records byte progress for a field's in-flight upload.
+  ///
+  /// Fires once per streamed chunk, so it throttles before publishing and
+  /// smooths the rate — a raw per-chunk figure on mobile data swings between 0
+  /// and several MB/s and reads as noise.
+  void _onUploadProgress(String id, int sent, int total) {
+    if (!mounted) return;
+    if (!_uploadingImages.value.contains(id)) return;
+
+    final now = DateTime.now();
+    final previous = _uploadSamples[id];
+    final complete = total > 0 && sent >= total;
+    if (previous != null &&
+        !complete &&
+        now.difference(previous.at) < _uploadProgressFrame) {
+      return;
+    }
+
+    double rate = _uploadProgress.value[id]?.bytesPerSecond ?? 0;
+    if (previous != null) {
+      final seconds = now.difference(previous.at).inMicroseconds / 1000000;
+      final delta = sent - previous.sent;
+      if (seconds > 0 && delta >= 0) {
+        final sample = delta / seconds;
+        rate = rate <= 0 ? sample : (rate * 0.7) + (sample * 0.3);
+      }
+    }
+
+    _uploadSamples[id] = (at: now, sent: sent);
+    _uploadProgress.value = {
+      ..._uploadProgress.value,
+      id: MediaFileProgress(sent: sent, total: total, bytesPerSecond: rate),
+    };
+  }
+
+  /// Shows what the server said when a capture-time upload fails.
+  ///
+  /// The file stays on the device and is retried before submit, so this is not
+  /// a dead end — but saying nothing made a failed upload look exactly like a
+  /// successful one, which is how media went missing without anyone noticing.
+  void _showUploadFailedSnack(Map<String, dynamic> result) {
+    if (!mounted) return;
+    final message = result['message']?.toString().trim();
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(message == null || message.isEmpty
+            ? 'Upload failed. It will be retried before you submit.'
+            : message),
+        backgroundColor: const Color(0xFFF59E0B),
+        duration: const Duration(seconds: 5),
+      ),
+    );
+  }
+
   // Mutating the Set in place wouldn't notify listeners, so assign a fresh Set.
   void _markUploading(String id) {
     if (_uploadingImages.value.contains(id)) return;
@@ -3372,6 +3447,10 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
   }
 
   void _unmarkUploading(String id) {
+    _uploadSamples.remove(id);
+    if (_uploadProgress.value.containsKey(id)) {
+      _uploadProgress.value = {..._uploadProgress.value}..remove(id);
+    }
     if (!_uploadingImages.value.contains(id)) return;
     _uploadingImages.value = {..._uploadingImages.value}..remove(id);
   }
@@ -3503,6 +3582,7 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
         inspectionId: _effectiveInspectionId,
         section: sectionTitle,
         itemId: fieldId,
+        onProgress: (sent, total) => _onUploadProgress(uniqueId, sent, total),
       );
       if (mounted) {
         _unmarkUploading(uniqueId);
@@ -3512,6 +3592,8 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
           await _saveDataLocally();
           try { await File(savedPath).delete(); } catch (_) {}
           _saveFieldToServer(item, uniqueId);
+        } else {
+          _showUploadFailedSnack(result);
         }
       }
     } else {
@@ -3573,6 +3655,7 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
         itemId: fieldId,
         fieldName: 'image',
         mediaType: 'video',
+        onProgress: (sent, total) => _onUploadProgress(uniqueId, sent, total),
       );
       final url = result['url']?.toString();
       uploaded = result['success'] == true && url != null && url.isNotEmpty;
@@ -3584,6 +3667,7 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
         try { await File(savedPath).delete(); } catch (_) {}
       } else {
         log('Video upload failed ($uniqueId): ${result['message']}');
+        _showUploadFailedSnack(result);
       }
       if (mounted) {
         _unmarkUploading(uniqueId);
@@ -3649,6 +3733,7 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
         section: sectionTitle,
         itemId: fieldId,
         fieldName: 'image',
+        onProgress: (sent, total) => _onUploadProgress(uniqueId, sent, total),
       );
       if (mounted) {
         _unmarkUploading(uniqueId);
@@ -3658,6 +3743,8 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
           await _saveDataLocally();
           try { await File(path).delete(); } catch (_) {}
           _saveFieldToServer(foundItem, uniqueId);
+        } else {
+          _showUploadFailedSnack(result);
         }
       }
     } else {
@@ -3723,6 +3810,7 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
         section: sectionTitle,
         itemId: fieldId,
         fieldName: 'image',
+        onProgress: (sent, total) => _onUploadProgress(uniqueId, sent, total),
       );
       if (mounted) {
         _unmarkUploading(uniqueId);
@@ -3736,6 +3824,8 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
           await _saveDataLocally();
           try { await File(path).delete(); } catch (_) {}
           _saveFieldToServer(foundItem, uniqueId);
+        } else {
+          _showUploadFailedSnack(result);
         }
       }
     } else {
@@ -4280,6 +4370,289 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
     );
   }
 
+  /// Every file the inspector has captured, in the order the form asks for it.
+  ///
+  /// Read fresh on each build of the status sheet: a value flips from a local
+  /// path to an https URL the moment its upload lands, and that flip is the
+  /// only record that the file made it.
+  List<({String label, String type, String value, String uniqueId})>
+      _capturedMedia() {
+    final media = <({String label, String type, String value, String uniqueId})>[];
+
+    for (final section in _sections) {
+      final sectionTitle = (section['title'] ?? '').toString();
+      final items = section['items'];
+      if (items is! List) continue;
+
+      for (final item in items) {
+        final uniqueId = _getItemUniqueId(item);
+        final title = _getItemTitle(item);
+        final label = sectionTitle.isEmpty ? title : '$title · $sectionTitle';
+
+        void add(String type, String? value) {
+          if (value == null || value.isEmpty) return;
+          media.add(
+              (label: label, type: type, value: value, uniqueId: uniqueId));
+        }
+
+        add('Photo', itemImages[uniqueId]);
+        add('Video', itemVideos[uniqueId]);
+        add('Audio', itemAudios[uniqueId]);
+        final filePayload = itemFiles[uniqueId];
+        if (filePayload != null && filePayload.isNotEmpty) {
+          add('Document', _filePathFromPayload(filePayload));
+        }
+        for (final path in itemMultiImages[uniqueId] ?? const <String>[]) {
+          add('Photo', path);
+        }
+      }
+    }
+
+    return media;
+  }
+
+  static IconData _mediaTypeIcon(String type) {
+    switch (type) {
+      case 'Video':
+        return Icons.videocam_outlined;
+      case 'Audio':
+        return Icons.mic_none;
+      case 'Document':
+        return Icons.description_outlined;
+      default:
+        return Icons.image_outlined;
+    }
+  }
+
+  /// The upload/completion sheet behind the header percentage.
+  ///
+  /// Two questions the inspector could not answer before opening this: has my
+  /// media actually reached the server, and what is still stopping me from
+  /// submitting. Both were only discoverable by pressing Submit and reading
+  /// what it refused to do.
+  void _showInspectionStatusSheet() {
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.white,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (sheetContext) {
+        return SafeArea(
+          child: ConstrainedBox(
+            constraints: BoxConstraints(
+              maxHeight: MediaQuery.of(sheetContext).size.height * 0.8,
+            ),
+            // Rebuilds on every upload tick, so a video's percentage moves
+            // while the sheet is open instead of freezing at whatever it read
+            // when it was pushed.
+            child: ValueListenableBuilder<Set<String>>(
+              valueListenable: _uploadingImages,
+              builder: (context, uploading, _) {
+                return ValueListenableBuilder<Map<String, MediaFileProgress>>(
+                  valueListenable: _uploadProgress,
+                  builder: (context, progress, __) {
+                    final media = _capturedMedia();
+                    final uploaded =
+                        media.where((m) => m.value.startsWith('http')).length;
+                    final groups = _getGroupedRequiredFieldErrors();
+                    final missing = groups.fold<int>(
+                        0, (sum, g) => sum + g.fields.length);
+
+                    return Column(
+                      mainAxisSize: MainAxisSize.min,
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        const SizedBox(height: 12),
+                        Center(
+                          child: Container(
+                            width: 40,
+                            height: 4,
+                            decoration: BoxDecoration(
+                              color: const Color(0xFFE4E7EB),
+                              borderRadius: BorderRadius.circular(2),
+                            ),
+                          ),
+                        ),
+                        Padding(
+                          padding: const EdgeInsets.fromLTRB(20, 16, 20, 4),
+                          child: Text(
+                            '$_progressPercent% complete',
+                            style: const TextStyle(
+                              fontSize: 18,
+                              fontWeight: FontWeight.w700,
+                              color: Color(0xFF111827),
+                            ),
+                          ),
+                        ),
+                        Padding(
+                          padding: const EdgeInsets.fromLTRB(20, 0, 20, 12),
+                          child: Text(
+                            media.isEmpty
+                                ? 'No media captured yet'
+                                : '$uploaded of ${media.length} files uploaded'
+                                    '${missing > 0 ? ' · $missing field${missing == 1 ? '' : 's'} still required' : ''}',
+                            style: const TextStyle(
+                                fontSize: 13, color: Color(0xFF6B7280)),
+                          ),
+                        ),
+                        const Divider(height: 1),
+                        Flexible(
+                          child: ListView(
+                            shrinkWrap: true,
+                            children: [
+                              if (media.isNotEmpty) ...[
+                                _statusSheetHeader('MEDIA'),
+                                ...media.map((m) => _mediaStatusRow(
+                                      m.label,
+                                      m.type,
+                                      m.value,
+                                      uploading.contains(m.uniqueId),
+                                      progress[m.uniqueId],
+                                    )),
+                              ],
+                              if (groups.isNotEmpty) ...[
+                                _statusSheetHeader('STILL REQUIRED'),
+                                ...groups.expand((group) => group.fields.map(
+                                      (field) => InkWell(
+                                        onTap: () {
+                                          Navigator.of(sheetContext).pop();
+                                          _jumpToSectionItem(
+                                              group.sectionIndex,
+                                              field.itemIndex);
+                                        },
+                                        child: Padding(
+                                          padding:
+                                              const EdgeInsets.symmetric(
+                                                  horizontal: 20,
+                                                  vertical: 12),
+                                          child: Row(
+                                            children: [
+                                              Container(
+                                                width: 6,
+                                                height: 6,
+                                                decoration:
+                                                    const BoxDecoration(
+                                                  color: Color(0xFFDC2626),
+                                                  shape: BoxShape.circle,
+                                                ),
+                                              ),
+                                              const SizedBox(width: 12),
+                                              Expanded(
+                                                child: Text(
+                                                  group.sectionTitle.isEmpty
+                                                      ? field.label
+                                                      : '${field.label} · ${group.sectionTitle}',
+                                                  style: const TextStyle(
+                                                      fontSize: 14,
+                                                      color:
+                                                          Color(0xFF111827)),
+                                                ),
+                                              ),
+                                              const Icon(Icons.chevron_right,
+                                                  size: 20,
+                                                  color: Color(0xFF9CA3AF)),
+                                            ],
+                                          ),
+                                        ),
+                                      ),
+                                    )),
+                              ],
+                              if (media.isEmpty && groups.isEmpty)
+                                const Padding(
+                                  padding: EdgeInsets.all(24),
+                                  child: Text(
+                                    'Everything is filled in and uploaded.',
+                                    textAlign: TextAlign.center,
+                                    style: TextStyle(
+                                        fontSize: 14,
+                                        color: Color(0xFF6B7280)),
+                                  ),
+                                ),
+                            ],
+                          ),
+                        ),
+                        const SizedBox(height: 8),
+                      ],
+                    );
+                  },
+                );
+              },
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _statusSheetHeader(String text) => Padding(
+        padding: const EdgeInsets.fromLTRB(20, 14, 20, 6),
+        child: Text(
+          text,
+          style: const TextStyle(
+            fontSize: 11,
+            fontWeight: FontWeight.w700,
+            letterSpacing: 0.5,
+            color: Color(0xFF9CA3AF),
+          ),
+        ),
+      );
+
+  /// One captured file and where it has got to.
+  Widget _mediaStatusRow(
+    String label,
+    String type,
+    String value,
+    bool uploading,
+    MediaFileProgress? progress,
+  ) {
+    final done = value.startsWith('http');
+    final String status;
+    final Color color;
+    if (done) {
+      status = 'Uploaded';
+      color = const Color(0xFF22C55E);
+    } else if (uploading) {
+      status = uploadBadgeLabel(progress);
+      color = const Color(0xFFF59E0B);
+    } else {
+      // Not a failure: it is on the device and goes up before submit. Saying
+      // "pending" rather than nothing is what stops the inspector assuming it
+      // is lost.
+      status = 'On device';
+      color = const Color(0xFF6B7280);
+    }
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
+      child: Row(
+        children: [
+          Icon(_mediaTypeIcon(type), size: 18, color: const Color(0xFF9CA3AF)),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Text(
+              label,
+              style: const TextStyle(fontSize: 14, color: Color(0xFF111827)),
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+            ),
+          ),
+          const SizedBox(width: 8),
+          Text(
+            status,
+            style: TextStyle(
+                fontSize: 12, fontWeight: FontWeight.w600, color: color),
+          ),
+          if (done) ...[
+            const SizedBox(width: 6),
+            const Icon(Icons.check_circle, size: 15, color: Color(0xFF22C55E)),
+          ],
+        ],
+      ),
+    );
+  }
+
   /// Shown when one or more media uploads fail during submission, so the user
   /// can retry instead of the field silently arriving empty on the server.
   void _showUploadFailedSheet(List<MediaUploadFailure> fields) {
@@ -4691,6 +5064,8 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
             itemId: fieldId,
             fieldName: 'image',
             mediaType: 'video',
+            onProgress: (sent, total) =>
+                _onUploadProgress(uniqueId, sent, total),
           );
           final url = result['url']?.toString();
           if (result['success'] == true && url != null && url.isNotEmpty) {
@@ -5175,11 +5550,23 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
       ),
       actions: [
         Center(
-          child: Padding(
-            padding: const EdgeInsets.only(right: 4),
-            child: Text(
-              '$_progressPercent% Complete',
-              style: const TextStyle(color: Colors.white60, fontSize: 12),
+          child: InkWell(
+            onTap: _showInspectionStatusSheet,
+            borderRadius: BorderRadius.circular(8),
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(8, 6, 4, 6),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    '$_progressPercent% Complete',
+                    style: const TextStyle(color: Colors.white60, fontSize: 12),
+                  ),
+                  const SizedBox(width: 2),
+                  const Icon(Icons.expand_more,
+                      size: 16, color: Colors.white60),
+                ],
+              ),
             ),
           ),
         ),
@@ -5712,9 +6099,18 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
                                       strokeWidth: 2, color: Colors.white),
                                 ),
                                 const SizedBox(width: 6),
-                                const Text('Uploading',
-                                    style: TextStyle(
-                                        color: Colors.white, fontSize: 12)),
+                                ValueListenableBuilder<
+                                    Map<String, MediaFileProgress>>(
+                                  valueListenable: _uploadProgress,
+                                  builder: (context, progress, _) => Text(
+                                    // No rate here: the chip sits over the
+                                    // camera preview and has no room for it.
+                                    uploadBadgeLabel(progress[uniqueId],
+                                        withRate: false),
+                                    style: const TextStyle(
+                                        color: Colors.white, fontSize: 12),
+                                  ),
+                                ),
                               ] else ...[
                                 const Icon(Icons.refresh,
                                     color: Colors.white, size: 14),
@@ -6592,6 +6988,7 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
     _audioRecorder?.dispose();
     _audioElapsed.dispose();
     _uploadingImages.dispose();
+    _uploadProgress.dispose();
     _highlightFlagIssues.dispose();
     _highlightMissingFieldId.dispose();
     _captureUi.dispose();

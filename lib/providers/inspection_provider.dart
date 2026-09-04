@@ -135,7 +135,30 @@ class InspectionNotifier extends _$InspectionNotifier {
   /// Refreshes the "awaiting upload" media queue from local storage, pruning
   /// progress entries for inspections that have fully drained.
   Future<void> _reloadMediaQueue() async {
-    final queue = await LocalStorageService.getInspectionsWithPendingMedia();
+    var queue = await LocalStorageService.getInspectionsWithPendingMedia();
+
+    // A pass killed mid-upload (force-close, OS reclaim, crash) leaves its
+    // entries at "uploading" forever: nothing else ever writes that status
+    // back, and the queue picks work by isUploaded, so the file was silently
+    // waiting for a retry while the Pending tab showed a live-looking
+    // "Uploading..." row for it. Reset any entry no running pass owns.
+    var resetStale = false;
+    for (final c in queue) {
+      if (_uploadingContainerIds.contains(c.id)) continue;
+      for (final e in c.pendingMedia.entries) {
+        if (e.value.uploadStatus != PendingMediaStatus.uploading) continue;
+        await LocalStorageService.setPendingMediaStatus(
+          inspectionId: c.id,
+          key: e.key,
+          status: PendingMediaStatus.queued,
+        );
+        resetStale = true;
+      }
+    }
+    if (resetStale) {
+      queue = await LocalStorageService.getInspectionsWithPendingMedia();
+    }
+
     queue.sort((a, b) => b.createdAt.compareTo(a.createdAt));
     final ids = queue.map((e) => e.id).toSet();
     final prunedProgress = {
@@ -143,6 +166,112 @@ class InspectionNotifier extends _$InspectionNotifier {
         if (ids.contains(e.key)) e.key: e.value,
     };
     state = state.copyWith(mediaQueue: queue, mediaProgress: prunedProgress);
+  }
+
+  /// Wall-clock sample of the last progress event per in-flight file, used to
+  /// derive a rate and to throttle. Not in [state]: it is bookkeeping, and
+  /// putting it there would rebuild the UI on every 64 KB chunk.
+  final Map<String, ({DateTime at, int sent})> _fileProgressSamples = {};
+
+  /// Files whose upload this pass still owns. A timed-out request is abandoned
+  /// by [ApiService.uploadImage] but its body keeps draining for a moment
+  /// afterwards, so without this a late chunk could re-publish a bar for a file
+  /// that has already been settled and cleared.
+  final Set<String> _inFlightFileKeys = {};
+
+  /// How often a transferring file is allowed to push a new frame. Chunks
+  /// arrive every few milliseconds on a fast link; at that rate the rebuilds
+  /// cost more than the upload.
+  static const Duration _progressFrame = Duration(milliseconds: 400);
+
+  /// Silence with no bytes for this long counts as stalled rather than slow.
+  /// Long enough that a normal pause between chunks on a weak signal does not
+  /// trip it, short enough to beat the 10-minute upload timeout by a mile.
+  static const Duration _stallAfter = Duration(seconds: 4);
+
+  /// Records byte progress for one queued file and publishes a smoothed rate.
+  ///
+  /// Called from [ApiService.uploadImage] on every streamed chunk, so it must
+  /// stay cheap and must throttle before touching [state].
+  void _reportFileProgress(String id, String key, int sent, int total) {
+    // Before anything touches `state`: reading it on a disposed notifier
+    // throws, and this runs inside the request body stream, so the throw would
+    // surface as a failed upload and mark a healthy file as failed.
+    if (!ref.mounted) return;
+    final mapKey = '$id/$key';
+    if (!_inFlightFileKeys.contains(mapKey)) return;
+    final now = DateTime.now();
+    final previous = _fileProgressSamples[mapKey];
+    final complete = total > 0 && sent >= total;
+
+    if (previous != null &&
+        !complete &&
+        now.difference(previous.at) < _progressFrame) {
+      return;
+    }
+
+    double rate = state.mediaFileProgress[mapKey]?.bytesPerSecond ?? 0;
+    if (previous != null) {
+      final seconds = now.difference(previous.at).inMicroseconds / 1000000;
+      final delta = sent - previous.sent;
+      if (seconds > 0 && delta >= 0) {
+        final sample = delta / seconds;
+        // Exponential smoothing: a raw per-frame rate on mobile data jumps
+        // between 0 and several MB/s and reads as noise.
+        rate = rate <= 0 ? sample : (rate * 0.7) + (sample * 0.3);
+      }
+    }
+
+    _fileProgressSamples[mapKey] = (at: now, sent: sent);
+    state = state.copyWith(
+      mediaFileProgress: {
+        ...state.mediaFileProgress,
+        mapKey: MediaFileProgress(sent: sent, total: total, bytesPerSecond: rate),
+      },
+    );
+  }
+
+  /// Drops a file's byte progress once it settles, so the row falls back to its
+  /// uploaded/failed status instead of freezing at whatever fraction it
+  /// reached.
+  void _clearFileProgress(String id, String key) {
+    final mapKey = '$id/$key';
+    _inFlightFileKeys.remove(mapKey);
+    _fileProgressSamples.remove(mapKey);
+    if (!ref.mounted) return;
+    if (!state.mediaFileProgress.containsKey(mapKey)) return;
+    state = state.copyWith(
+      mediaFileProgress: {...state.mediaFileProgress}..remove(mapKey),
+    );
+  }
+
+  /// Zeroes the rate of any in-flight file that has not moved for
+  /// [_stallAfter], so the row stops advertising a speed and an ETA.
+  ///
+  /// Progress is chunk-driven: when a transfer stalls, no callback fires at
+  /// all, so the last good "1.8 MB/s, 41s left" would otherwise sit on screen
+  /// claiming the upload is healthy right up to the 10-minute timeout. This
+  /// tick is the only thing that can tell the difference between slow and
+  /// stopped.
+  void _tickStalledProgress(String id) {
+    if (!ref.mounted) return;
+    final now = DateTime.now();
+    final prefix = '$id/';
+    var next = state.mediaFileProgress;
+    var changed = false;
+
+    for (final mapKey in _inFlightFileKeys) {
+      if (!mapKey.startsWith(prefix)) continue;
+      final current = next[mapKey];
+      final sample = _fileProgressSamples[mapKey];
+      if (current == null || sample == null) continue;
+      if (current.bytesPerSecond <= 0) continue;
+      if (now.difference(sample.at) < _stallAfter) continue;
+      next = {...next, mapKey: current.copyWith(bytesPerSecond: 0)};
+      changed = true;
+    }
+
+    if (changed) state = state.copyWith(mediaFileProgress: next);
   }
 
   void _setMediaProgress(String id, MediaUploadProgress progress) {
@@ -314,6 +443,10 @@ class InspectionNotifier extends _$InspectionNotifier {
   Future<void> _uploadContainerMedia(String id) async {
     if (_uploadingContainerIds.contains(id)) return;
     _uploadingContainerIds.add(id);
+    final stallTicker = Timer.periodic(
+      const Duration(seconds: 1),
+      (_) => _tickStalledProgress(id),
+    );
     try {
       var container = await LocalStorageService.getMediaQueueById(id);
       if (container == null) return;
@@ -369,37 +502,58 @@ class InspectionNotifier extends _$InspectionNotifier {
               !(e.value.isUploaded && (e.value.uploadedUrl?.isNotEmpty ?? false)))
           .toList();
 
-      // Mark the whole batch "uploading" (sequential RMW) and show it once.
-      for (final entry in pending) {
-        await LocalStorageService.setPendingMediaStatus(
-          inspectionId: id,
-          key: entry.key,
-          status: PendingMediaStatus.uploading,
-        );
-      }
-      if (pending.isNotEmpty) await _patchContainerInState(id);
-
+      // Photos first, then videos one at a time. A clip uploading beside other
+      // files splits the link four ways, so nothing finished for minutes and
+      // the card sat at "0 of 6" with every row reading "Uploading..." — a
+      // working queue that looked hung. Photos take ~2s each, so front-loading
+      // them moves the counter immediately, and a lone video then gets the
+      // whole link instead of a quarter of it.
       const uploadConcurrency = 4;
-      for (var i = 0; i < pending.length; i += uploadConcurrency) {
-        final end = (i + uploadConcurrency < pending.length)
-            ? i + uploadConcurrency
-            : pending.length;
-        final chunk = pending.sublist(i, end);
+      final photos = pending.where((e) => e.value.mediaType != 'video').toList();
+      final videos = pending.where((e) => e.value.mediaType == 'video').toList();
+      final batches = <List<MapEntry<String, PendingMedia>>>[
+        for (var i = 0; i < photos.length; i += uploadConcurrency)
+          photos.sublist(
+              i,
+              i + uploadConcurrency < photos.length
+                  ? i + uploadConcurrency
+                  : photos.length),
+        for (final v in videos) [v],
+      ];
+
+      for (final chunk in batches) {
+        // Mark only the files starting right now. Marking the whole batch
+        // upfront made every row claim "Uploading..." while most were still
+        // waiting their turn, which is indistinguishable from a hang.
+        for (final entry in chunk) {
+          await LocalStorageService.setPendingMediaStatus(
+            inspectionId: id,
+            key: entry.key,
+            status: PendingMediaStatus.uploading,
+          );
+        }
+        await _patchContainerInState(id);
 
         // Upload this chunk concurrently (no Hive writes here).
         final results = await Future.wait(chunk.map((entry) async {
           final media = entry.value;
+          _inFlightFileKeys.add('$id/${entry.key}');
           final result = await ApiService.uploadImage(
             media.localPath,
             inspectionId: serverId,
             section: media.section,
             itemId: media.itemId,
             mediaType: media.mediaType,
+            onProgress: (sent, total) =>
+                _reportFileProgress(id, entry.key, sent, total),
           );
+          _clearFileProgress(id, entry.key);
           return MapEntry(entry.key, result);
         }));
 
-        // Apply each result's status sequentially (RMW-safe).
+        // Apply each result's status sequentially (RMW-safe), patching after
+        // every file so a row flips when its own upload lands rather than when
+        // the slowest file beside it does.
         for (final r in results) {
           final url = r.value['url']?.toString();
           if (r.value['success'] == true && url != null && url.isNotEmpty) {
@@ -419,18 +573,17 @@ class InspectionNotifier extends _$InspectionNotifier {
             );
             failed++;
           }
-        }
 
-        // One state + progress patch per chunk instead of per file.
-        await _patchContainerAndProgress(
-          id,
-          MediaUploadProgress(
-            total: total,
-            uploaded: uploaded,
-            failed: failed,
-            isUploading: true,
-          ),
-        );
+          await _patchContainerAndProgress(
+            id,
+            MediaUploadProgress(
+              total: total,
+              uploaded: uploaded,
+              failed: failed,
+              isUploading: true,
+            ),
+          );
+        }
       }
 
       // 2) Re-read and group remaining entries by their form field.
@@ -513,11 +666,24 @@ class InspectionNotifier extends _$InspectionNotifier {
     } catch (e) {
       log('Error uploading container media ($id): $e');
     } finally {
+      stallTicker.cancel();
       _uploadingContainerIds.remove(id);
       // Always clear a lingering spinner even if something threw mid-pass.
       final p = state.mediaProgress[id];
       if (p != null && p.isUploading) {
         _setMediaProgress(id, p.copyWith(isUploading: false));
+      }
+      // Same for a half-filled byte bar: a throw skips the per-file clear, and
+      // a bar frozen at 40% is the exact thing this whole change exists to
+      // stop showing.
+      final prefix = '$id/';
+      _inFlightFileKeys.removeWhere((k) => k.startsWith(prefix));
+      _fileProgressSamples.removeWhere((k, _) => k.startsWith(prefix));
+      if (state.mediaFileProgress.keys.any((k) => k.startsWith(prefix))) {
+        state = state.copyWith(
+          mediaFileProgress: {...state.mediaFileProgress}
+            ..removeWhere((k, _) => k.startsWith(prefix)),
+        );
       }
     }
   }

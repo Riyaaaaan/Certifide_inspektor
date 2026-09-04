@@ -8,6 +8,7 @@ import '../../constants/hive_constants.dart';
 import '../../data/inspection_storage_model.dart';
 import '../../models/inspection_history_model.dart';
 import '../../models/inspection_state.dart';
+import '../../utils/upload_display.dart';
 import '../../models/inspection_template_model.dart';
 import '../../models/local_inspection.dart';
 import '../../models/pending_media.dart';
@@ -102,24 +103,36 @@ class _ReportsPageState extends ConsumerState<ReportsPage>
   }
 
   String _mediaRowLabel(String key, PendingMedia m) {
+    final String type;
     switch (m.mediaType) {
       case 'video':
-        return 'Video';
+        type = 'Video';
       case 'audio':
-        return 'Audio';
+        type = 'Audio';
       case 'file':
-        return 'Document';
+        type = 'Document';
       case 'multiImage':
         final idx = int.tryParse(key.split('_').last);
-        return idx != null ? 'Photo ${idx + 1}' : 'Photo';
+        type = idx != null ? 'Photo ${idx + 1}' : 'Photo';
       case 'image':
       default:
-        return 'Image';
+        type = 'Image';
     }
+
+    // Name the section the file came from. Four rows all reading "Video" tell
+    // the inspector nothing about which one is stuck or which one just
+    // finished; "Video · Engine Bay" does.
+    final section = m.section.trim();
+    return section.isEmpty ? type : '$type · $section';
   }
 
   /// One media file with its own progress bar + status.
-  Widget _mediaFileRow(String key, PendingMedia m) {
+  ///
+  /// [live] is the byte-level progress for this file when it is the one on the
+  /// wire. With it the row shows how far a video actually is; without it a
+  /// two-minute clip sat behind an indeterminate bar that looked identical to
+  /// a hang.
+  Widget _mediaFileRow(String key, PendingMedia m, MediaFileProgress? live) {
     final status = m.uploadStatus;
     final uploading = status == PendingMediaStatus.uploading;
     final done = status == PendingMediaStatus.uploaded;
@@ -128,12 +141,49 @@ class _ReportsPageState extends ConsumerState<ReportsPage>
     final Color barColor = failed
         ? const Color(0xFFEF4444)
         : (done ? const Color(0xFF22C55E) : CarSpyColors.primary);
-    // null => indeterminate (actively uploading); else a filled fraction.
-    final double? barValue = uploading ? null : (done || failed ? 1.0 : 0.05);
+    // Real fraction while bytes are moving; indeterminate only before the
+    // first sample; a thin stub for a file still waiting its turn.
+    final double? barValue = done || failed
+        ? 1.0
+        : (live != null && live.total > 0 ? live.fraction : (uploading ? null : 0.05));
 
     final String statusText = failed
         ? 'Failed'
-        : (done ? 'Uploaded' : (uploading ? 'Uploading…' : 'Queued'));
+        : (done
+            ? 'Uploaded'
+            : (uploading
+                ? (live != null && live.total > 0
+                    ? '${(live.fraction * 100).round()}%'
+                    : 'Uploading…')
+                : 'Queued'));
+
+    // "12.4 of 88.1 MB · 1.8 MB/s · 41s left" — three independent signals that
+    // the transfer is alive.
+    // A zero rate on a file that has already sent bytes means the provider's
+    // stall tick fired: nothing has moved for seconds. Say so rather than
+    // leaving the last good speed on screen, which reads as healthy.
+    final stalled =
+        live != null && live.sent > 0 && live.bytesPerSecond <= 0;
+
+    // What the server actually said, kept verbatim. A row reading only
+    // "Failed" gives the inspector nothing to act on, while "File is too large"
+    // and "Session expired" call for opposite responses.
+    final String? failureReason =
+        failed && (m.lastError?.trim().isNotEmpty ?? false)
+            ? (m.retryCount > 1
+                ? '${m.lastError!.trim()} (${m.retryCount} attempts)'
+                : m.lastError!.trim())
+            : null;
+
+    final String? detail = uploading && live != null && live.total > 0
+        ? [
+            '${formatBytes(live.sent)} of ${formatBytes(live.total)}',
+            if (live.bytesPerSecond > 0)
+              '${formatBytes(live.bytesPerSecond.round())}/s',
+            if (live.eta != null) '${formatShortDuration(live.eta!)} left',
+            if (stalled) 'waiting for the network',
+          ].join(' · ')
+        : failureReason;
 
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 6),
@@ -179,6 +229,22 @@ class _ReportsPageState extends ConsumerState<ReportsPage>
                     valueColor: AlwaysStoppedAnimation<Color>(barColor),
                   ),
                 ),
+                if (detail != null) ...[
+                  const SizedBox(height: 3),
+                  Text(
+                    detail,
+                    style: TextStyle(
+                      fontSize: 10.5,
+                      color: failureReason != null
+                          ? const Color(0xFFEF4444)
+                          : (stalled
+                              ? const Color(0xFFF59E0B)
+                              : CarSpyColors.onSurfaceVariant),
+                    ),
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ],
               ],
             ),
           ),
@@ -203,6 +269,20 @@ class _ReportsPageState extends ConsumerState<ReportsPage>
     );
   }
 
+  /// The first real failure recorded against a queue container, straight from
+  /// the server's response. Null when nothing failed with a message.
+  String? _firstQueueError(String containerId) {
+    for (final c in ref.read(inspectionProvider).mediaQueue) {
+      if (c.id != containerId) continue;
+      for (final m in c.pendingMedia.values) {
+        if (m.uploadStatus != PendingMediaStatus.failed) continue;
+        final error = m.lastError?.trim();
+        if (error != null && error.isNotEmpty) return error;
+      }
+    }
+    return null;
+  }
+
   Future<void> _uploadMedia(LocalInspection container) async {
     if (_uploadingMediaIds.contains(container.id)) return;
     _safeSetState(() => _uploadingMediaIds.add(container.id));
@@ -211,12 +291,19 @@ class _ReportsPageState extends ConsumerState<ReportsPage>
           .read(inspectionProvider.notifier)
           .uploadInspectionMedia(container);
       if (!mounted) return;
+
+      // Report what the server said, not that "something" is pending. The old
+      // wording claimed the upload would retry when online even when the real
+      // answer was a validation error or an expired session, neither of which
+      // fixes itself.
+      final reason = ok ? null : _firstQueueError(container.id);
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text(ok
               ? 'All media uploaded'
-              : 'Some media still pending — will retry when online'),
+              : (reason ?? 'Some media still pending — will retry when online')),
           backgroundColor: ok ? const Color(0xFF22C55E) : const Color(0xFFF59E0B),
+          duration: Duration(seconds: ok ? 3 : 6),
         ),
       );
     } catch (e) {
@@ -871,7 +958,11 @@ class _ReportsPageState extends ConsumerState<ReportsPage>
   Widget _buildPendingTab() {
     final media = ref.watch(
       inspectionProvider.select(
-        (s) => (queue: s.mediaQueue, progress: s.mediaProgress),
+        (s) => (
+          queue: s.mediaQueue,
+          progress: s.mediaProgress,
+          files: s.mediaFileProgress,
+        ),
       ),
     );
     final mediaQueue = media.queue;
@@ -942,7 +1033,8 @@ class _ReportsPageState extends ConsumerState<ReportsPage>
           .add(() => _buildSectionHeader('AWAITING UPLOAD', mediaQueue.length));
       for (final container in mediaQueue) {
         final progress = media.progress[container.id];
-        rowBuilders.add(() => _buildAwaitingUploadCard(container, progress));
+        rowBuilders.add(
+            () => _buildAwaitingUploadCard(container, progress, media.files));
       }
     }
     if (hasServer) {
@@ -1022,6 +1114,7 @@ class _ReportsPageState extends ConsumerState<ReportsPage>
   Widget _buildAwaitingUploadCard(
     LocalInspection container,
     MediaUploadProgress? progress,
+    Map<String, MediaFileProgress> fileProgress,
   ) {
     final vehicleInfo =
         (container.data['vehicleInfo'] as Map?)?.cast<String, dynamic>() ??
@@ -1044,6 +1137,15 @@ class _ReportsPageState extends ConsumerState<ReportsPage>
     final fraction = total == 0 ? 0.0 : (uploaded / total).clamp(0.0, 1.0);
 
     // The per-file list auto-expands while uploading; can also be toggled.
+    // The file actually on the wire right now, if any — used in the summary
+    // line so a collapsed card still says what it is working on.
+    String? activeLabel;
+    for (final e in container.pendingMedia.entries) {
+      if (e.value.uploadStatus != PendingMediaStatus.uploading) continue;
+      activeLabel = _mediaRowLabel(e.key, e.value);
+      break;
+    }
+
     final expanded = isUploading || _expandedMediaIds.contains(container.id);
     // Only sort when the per-file list is actually shown. Collapsed cards (the
     // common case) skip the O(n log n) sort on every rebuild during upload.
@@ -1145,7 +1247,13 @@ class _ReportsPageState extends ConsumerState<ReportsPage>
                         ? '$uploaded of $total uploaded · $failed failed'
                         : (remaining == 0
                             ? 'All $total media uploaded'
-                            : '$uploaded of $total media uploaded'),
+                            : isUploading
+                                // Name the file on the wire. "0 of 6" alone
+                                // says nothing about whether anything is
+                                // actually happening.
+                                ? '$uploaded of $total uploaded · '
+                                    '${activeLabel ?? 'starting'} now'
+                                : '$uploaded of $total media uploaded'),
                     style: const TextStyle(fontSize: 13, color: Colors.black54),
                   ),
                 ),
@@ -1176,7 +1284,11 @@ class _ReportsPageState extends ConsumerState<ReportsPage>
               const SizedBox(height: 6),
               const Divider(height: 1),
               const SizedBox(height: 2),
-              ...mediaEntries.map((e) => _mediaFileRow(e.key, e.value)),
+              ...mediaEntries.map((e) => _mediaFileRow(
+                    e.key,
+                    e.value,
+                    fileProgress['${container.id}/${e.key}'],
+                  )),
             ],
             const SizedBox(height: 8),
             Align(

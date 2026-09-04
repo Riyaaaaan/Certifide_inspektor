@@ -273,4 +273,160 @@ void main() {
       expect(titles['42'], 'Engine');
     });
   });
+
+  group('refreshMediaQueue — a killed pass must not leave a live-looking row',
+      () {
+    test(
+        'Given entries left at "uploading" by a killed pass, When the queue is '
+        'refreshed, Then they are reset to queued', () async {
+      final video = makeFile('stale_uploading.mp4');
+      final id = await queueOneVideo(6100, path: video.path);
+      await LocalStorageService.setPendingMediaStatus(
+        inspectionId: id,
+        key: 'video_v',
+        status: PendingMediaStatus.uploading,
+      );
+      ConnectivityChecker.debugReachableOverride = false;
+
+      final container = offlineContainer();
+      await container.read(inspectionProvider.notifier).refreshMediaQueue();
+
+      final after = await LocalStorageService.getMediaQueueById(id);
+      expect(after!.pendingMedia['video_v']!.uploadStatus,
+          PendingMediaStatus.queued,
+          reason: 'the Pending tab renders "Uploading..." off this status, so a '
+              'stale value shows a spinner for a file nobody is uploading');
+      expect(after.pendingMedia['video_v']!.isUploaded, isFalse,
+          reason: 'the reset must not fake progress');
+    });
+
+    test(
+        'Given an entry that already uploaded, When the queue is refreshed, '
+        'Then its status is left alone', () async {
+      final video = makeFile('already_uploaded.mp4');
+      final id = await queueOneVideo(6101, path: video.path);
+      await LocalStorageService.setPendingMediaStatus(
+        inspectionId: id,
+        key: 'video_v',
+        status: PendingMediaStatus.uploaded,
+        url: 'https://api.certifide.in/inspections/files/x.mp4',
+      );
+      ConnectivityChecker.debugReachableOverride = false;
+
+      final container = offlineContainer();
+      await container.read(inspectionProvider.notifier).refreshMediaQueue();
+
+      final after = await LocalStorageService.getMediaQueueById(id);
+      expect(after!.pendingMedia['video_v']!.isUploaded, isTrue);
+      expect(after.pendingMedia['video_v']!.uploadedUrl, isNotEmpty);
+    });
+
+    test(
+        'Given a failed entry, When the queue is refreshed, Then the failure '
+        'and its error survive for the retry button', () async {
+      final video = makeFile('failed_entry.mp4');
+      final id = await queueOneVideo(6102, path: video.path);
+      await LocalStorageService.setPendingMediaStatus(
+        inspectionId: id,
+        key: 'video_v',
+        status: PendingMediaStatus.failed,
+        error: 'Validation failed',
+      );
+      ConnectivityChecker.debugReachableOverride = false;
+
+      final container = offlineContainer();
+      await container.read(inspectionProvider.notifier).refreshMediaQueue();
+
+      final after = await LocalStorageService.getMediaQueueById(id);
+      expect(after!.pendingMedia['video_v']!.uploadStatus,
+          PendingMediaStatus.failed);
+      expect(after.pendingMedia['video_v']!.lastError, 'Validation failed');
+    });
+  });
+
+  group('MediaFileProgress — the numbers behind the byte-level bar', () {
+    test('Given a part-sent file, When read, Then the fraction is sent/total',
+        () {
+      const p = MediaFileProgress(sent: 25, total: 100);
+      expect(p.fraction, 0.25);
+    });
+
+    test('Given a zero total, When read, Then the fraction is 0, not NaN', () {
+      const p = MediaFileProgress(sent: 10, total: 0);
+      expect(p.fraction, 0.0,
+          reason: 'a NaN reaches LinearProgressIndicator and throws');
+    });
+
+    test(
+        'Given more bytes sent than the body length, When read, Then the '
+        'fraction is clamped to 1', () {
+      const p = MediaFileProgress(sent: 150, total: 100);
+      expect(p.fraction, 1.0);
+    });
+
+    test('Given a known rate, When read, Then the ETA is the remainder over it',
+        () {
+      const p =
+          MediaFileProgress(sent: 1000, total: 5000, bytesPerSecond: 1000);
+      expect(p.eta, const Duration(seconds: 4));
+    });
+
+    test('Given no rate yet, When read, Then there is no ETA to show', () {
+      const p = MediaFileProgress(sent: 1000, total: 5000);
+      expect(p.eta, isNull,
+          reason: 'an ETA computed from a zero rate is infinite');
+    });
+
+    test('Given a finished file, When read, Then there is no ETA', () {
+      const p =
+          MediaFileProgress(sent: 5000, total: 5000, bytesPerSecond: 1000);
+      expect(p.eta, isNull);
+    });
+
+    test(
+        'Given a rate so slow the ETA runs to days, When read, Then no ETA is '
+        'offered', () {
+      const p = MediaFileProgress(
+          sent: 0, total: 1000000000, bytesPerSecond: 1);
+      expect(p.eta, isNull,
+          reason: '"11574d left" is noise, not information');
+    });
+
+    test('Given two identical values, When compared, Then they are equal', () {
+      const a = MediaFileProgress(sent: 1, total: 2, bytesPerSecond: 3);
+      const b = MediaFileProgress(sent: 1, total: 2, bytesPerSecond: 3);
+      expect(a, b);
+      expect(a.hashCode, b.hashCode);
+    });
+  });
+
+  group('InspectionState — byte progress must survive copyWith and ==', () {
+    test(
+        'Given byte progress in state, When an unrelated field is copied, Then '
+        'the progress is carried over', () {
+      const state = InspectionState(
+        mediaFileProgress: {'i/v': MediaFileProgress(sent: 1, total: 2)},
+      );
+
+      final copied = state.copyWith(isLoading: true);
+
+      expect(copied.mediaFileProgress['i/v']?.sent, 1,
+          reason: 'dropping it here would blank the bar on every other update');
+    });
+
+    test(
+        'Given two states differing only in byte progress, When compared, Then '
+        'they are not equal', () {
+      const a = InspectionState(
+        mediaFileProgress: {'i/v': MediaFileProgress(sent: 1, total: 10)},
+      );
+      const b = InspectionState(
+        mediaFileProgress: {'i/v': MediaFileProgress(sent: 5, total: 10)},
+      );
+
+      expect(a == b, isFalse,
+          reason: 'equal states are skipped by Riverpod, so the bar would '
+              'never move');
+    });
+  });
 }

@@ -23,6 +23,53 @@ import '../screens/auth/login_page.dart';
 import 'local_storage_services.dart';
 import 'reference_media_cache.dart';
 
+/// Reports upload progress: bytes written so far and the total to write.
+///
+/// Fires once per streamed chunk, so callers that rebuild UI must throttle.
+typedef UploadProgressCallback = void Function(int sent, int total);
+
+/// A multipart request that reports bytes as they go out.
+///
+/// `http` has no progress hook, so the body stream returned by [finalize] is
+/// passed through a counting transformer. Transforming rather than piping into
+/// another request keeps the consumer in control of the pace: the file is read
+/// only as fast as the socket drains it, which is what stops a 90 MB video
+/// from being pulled into memory. Deferring to `super.finalize()` also keeps
+/// the multipart content-type and its boundary, without which the server
+/// cannot parse the body at all.
+///
+/// The count is bytes handed to the socket, not bytes acknowledged by the
+/// server, so on a stalling link it can run ahead by roughly one send buffer.
+/// That is a rounding error against a video, and it is the same figure any
+/// progress-capable HTTP client reports.
+@visibleForTesting
+class ProgressMultipartRequest extends http.MultipartRequest {
+  ProgressMultipartRequest(super.method, super.url, {this.onProgress});
+
+  final UploadProgressCallback? onProgress;
+
+  @override
+  http.ByteStream finalize() {
+    final body = super.finalize();
+    final report = onProgress;
+    if (report == null) return body;
+
+    final total = contentLength;
+    var sent = 0;
+    return http.ByteStream(
+      body.transform(
+        StreamTransformer<List<int>, List<int>>.fromHandlers(
+          handleData: (chunk, sink) {
+            sink.add(chunk);
+            sent += chunk.length;
+            report(sent, total);
+          },
+        ),
+      ),
+    );
+  }
+}
+
 /// Thrown inside [ApiService.uploadImage] when no auth token can be read while
 /// (re)building a multipart upload request.
 class _SessionExpired implements Exception {
@@ -673,6 +720,7 @@ class ApiService {
     required String itemId,
     String fieldName = 'image',
     String? mediaType,
+    UploadProgressCallback? onProgress,
   }) async {
     try {
       log('Uploading media (${mediaType ?? fieldName})');
@@ -756,9 +804,10 @@ class ApiService {
         if (authToken == null) {
           throw const _SessionExpired();
         }
-        final request = http.MultipartRequest(
+        final request = ProgressMultipartRequest(
           'POST',
           Uri.parse('$baseUrl$endpoint'),
+          onProgress: onProgress,
         );
         request.headers['Authorization'] = 'Bearer $authToken';
         request.headers['Accept'] = 'application/json';
@@ -773,10 +822,19 @@ class ApiService {
         if (inspectionId != null) {
           request.fields['inspection_id'] = inspectionId.toString();
         }
-        final response = await request.send().timeout(_uploadTimeout);
-        final body =
-            await response.stream.bytesToString().timeout(_uploadTimeout);
-        return (status: response.statusCode, body: body);
+        // Own the client so the connection is released on every exit path,
+        // including a timeout mid-transfer. BaseRequest.send() closes its own
+        // client only once the response body has been read, which never
+        // happens when the send itself times out.
+        final client = http.Client();
+        try {
+          final response = await client.send(request).timeout(_uploadTimeout);
+          final body =
+              await response.stream.bytesToString().timeout(_uploadTimeout);
+          return (status: response.statusCode, body: body);
+        } finally {
+          client.close();
+        }
       }
 
       log('Upload request fields: section=$section, itemId=$itemId, inspectionId=$inspectionId');

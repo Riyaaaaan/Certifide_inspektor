@@ -55,6 +55,60 @@ class MediaUploadProgress {
   int get hashCode => Object.hash(total, uploaded, failed, isUploading);
 }
 
+/// Byte-level progress for the ONE media file currently being uploaded.
+///
+/// [MediaUploadProgress] counts whole files, which stands still for minutes
+/// while a video transfers. This is what tells the inspector the difference
+/// between a slow upload and a dead one.
+@immutable
+class MediaFileProgress {
+  /// Bytes handed to the socket so far.
+  final int sent;
+
+  /// Total bytes in the request body (slightly larger than the file itself:
+  /// multipart headers and boundaries are included).
+  final int total;
+
+  /// Smoothed transfer rate in bytes per second. 0 until two samples exist.
+  final double bytesPerSecond;
+
+  const MediaFileProgress({
+    required this.sent,
+    required this.total,
+    this.bytesPerSecond = 0,
+  });
+
+  double get fraction => total <= 0 ? 0 : (sent / total).clamp(0.0, 1.0);
+
+  /// Seconds left at the current rate, or null when it cannot be estimated.
+  /// Never shown as a countdown the inspector can hold us to — it is a hint
+  /// that bytes are still moving.
+  Duration? get eta {
+    if (bytesPerSecond <= 0 || total <= 0 || sent >= total) return null;
+    final secs = (total - sent) / bytesPerSecond;
+    if (!secs.isFinite || secs < 0 || secs > 60 * 60 * 6) return null;
+    return Duration(seconds: secs.round());
+  }
+
+  MediaFileProgress copyWith({int? sent, int? total, double? bytesPerSecond}) {
+    return MediaFileProgress(
+      sent: sent ?? this.sent,
+      total: total ?? this.total,
+      bytesPerSecond: bytesPerSecond ?? this.bytesPerSecond,
+    );
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      other is MediaFileProgress &&
+      other.sent == sent &&
+      other.total == total &&
+      other.bytesPerSecond == bytesPerSecond;
+
+  @override
+  int get hashCode => Object.hash(sent, total, bytesPerSecond);
+}
+
 class InspectionState {
   final List<LocalInspection> inspections;
   final bool isLoading;
@@ -71,6 +125,12 @@ class InspectionState {
   /// Per-inspection media upload progress, keyed by [LocalInspection.id].
   final Map<String, MediaUploadProgress> mediaProgress;
 
+  /// Byte-level progress for files currently in flight, keyed by
+  /// `'<inspection id>/<pendingMedia key>'`. An entry exists only while its
+  /// file is transferring; it is removed the moment the file settles, so a
+  /// stale bar can never outlive its upload.
+  final Map<String, MediaFileProgress> mediaFileProgress;
+
   const InspectionState({
     this.inspections = const [],
     this.isLoading = false,
@@ -80,6 +140,7 @@ class InspectionState {
     this.uploadingImagesStates = const {},
     this.mediaQueue = const [],
     this.mediaProgress = const {},
+    this.mediaFileProgress = const {},
   });
 
   InspectionState copyWith({
@@ -91,6 +152,7 @@ class InspectionState {
     Map<String, bool>? uploadingImagesStates,
     List<LocalInspection>? mediaQueue,
     Map<String, MediaUploadProgress>? mediaProgress,
+    Map<String, MediaFileProgress>? mediaFileProgress,
   }) {
     return InspectionState(
       inspections: inspections ?? this.inspections,
@@ -102,6 +164,7 @@ class InspectionState {
           uploadingImagesStates ?? this.uploadingImagesStates,
       mediaQueue: mediaQueue ?? this.mediaQueue,
       mediaProgress: mediaProgress ?? this.mediaProgress,
+      mediaFileProgress: mediaFileProgress ?? this.mediaFileProgress,
     );
   }
 
@@ -116,7 +179,8 @@ class InspectionState {
         mapEquals(other.submittingStates, submittingStates) &&
         mapEquals(other.uploadingImagesStates, uploadingImagesStates) &&
         listEquals(other.mediaQueue, mediaQueue) &&
-        mapEquals(other.mediaProgress, mediaProgress);
+        mapEquals(other.mediaProgress, mediaProgress) &&
+        mapEquals(other.mediaFileProgress, mediaFileProgress);
   }
 
   @override
@@ -134,6 +198,9 @@ class InspectionState {
         Object.hashAll(mediaQueue),
         Object.hashAll(
           mediaProgress.entries.map((e) => Object.hash(e.key, e.value)),
+        ),
+        Object.hashAll(
+          mediaFileProgress.entries.map((e) => Object.hash(e.key, e.value)),
         ),
       );
 }

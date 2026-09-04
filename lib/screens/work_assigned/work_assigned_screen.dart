@@ -1,11 +1,9 @@
-import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:intl/intl.dart';
 
 import '../../models/booking.dart';
 import '../../providers/bookings_provider.dart';
-import '../../services/notification_service.dart';
 import '../home/car_spy/car_spy_data.dart';
 import 'booking_detail_screen.dart';
 
@@ -107,28 +105,6 @@ class _WorkAssignedScreenState extends ConsumerState<WorkAssignedScreen>
     );
   }
 
-  /// Debug helper — fires a local notification of the given type. Tapping it
-  /// should route to Work Assigned (assignment/today) or Attendance (reminders).
-  void _fireTestNotification(String type) {
-    const titles = {
-      'inspection_assigned': 'New inspection assigned',
-      'inspections_today': "Today's inspections",
-      'attendance_check_in_reminder': 'Check-in reminder',
-      'attendance_check_out_reminder': 'Check-out reminder',
-    };
-    const bodies = {
-      'inspection_assigned': 'Swift Dzire — 18 Jun at 10:30',
-      'inspections_today': 'Swift Dzire 09:30, i20 14:00',
-      'attendance_check_in_reminder': 'You have 2 inspections today. Check in.',
-      'attendance_check_out_reminder': "Don't forget to check out for today.",
-    };
-    NotificationService.showLocal(
-      title: titles[type] ?? 'Certifide',
-      body: bodies[type] ?? '',
-      type: type,
-    );
-  }
-
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -145,36 +121,6 @@ class _WorkAssignedScreenState extends ConsumerState<WorkAssignedScreen>
             color: Color(0xFF172B4D),
           ),
         ),
-        actions: [
-          // Debug-only: fire a local test notification to verify display + the
-          // tap-to-tab routing without waiting on the backend. Stripped from
-          // release builds.
-          if (kDebugMode)
-            PopupMenuButton<String>(
-              icon: const Icon(Icons.notifications_active_outlined,
-                  color: Color(0xFF172B4D)),
-              tooltip: 'Test notification',
-              onSelected: _fireTestNotification,
-              itemBuilder: (_) => const [
-                PopupMenuItem(
-                  value: 'inspection_assigned',
-                  child: Text('Inspection assigned → Work Assigned'),
-                ),
-                PopupMenuItem(
-                  value: 'inspections_today',
-                  child: Text("Today's inspections → Work Assigned"),
-                ),
-                PopupMenuItem(
-                  value: 'attendance_check_in_reminder',
-                  child: Text('Check-in reminder → Attendance'),
-                ),
-                PopupMenuItem(
-                  value: 'attendance_check_out_reminder',
-                  child: Text('Check-out reminder → Attendance'),
-                ),
-              ],
-            ),
-        ],
         bottom: TabBar(
           controller: _tabController,
           // Scrollable so the tabs size to their content: four fixed tabs

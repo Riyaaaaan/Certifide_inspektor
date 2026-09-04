@@ -312,19 +312,6 @@ class NotificationService {
     }
   }
 
-  /// Test helper — fire a local notification without a server round-trip.
-  static Future<void> showLocal({
-    required String title,
-    required String body,
-    String? type,
-  }) =>
-      showFromRemoteMessage(
-        RemoteMessage(
-          notification: RemoteNotification(title: title, body: body),
-          data: {if (type != null) 'type': type},
-        ),
-      );
-
   /// Consume a pending tab request (returns and clears it).
   static int? takePendingTab() {
     final v = requestedTab.value;

@@ -819,6 +819,36 @@ class InspectionNotifier extends _$InspectionNotifier {
 
       var currentInspection = inspection;
 
+      // Tracks whether any media failed to upload this pass. If so we must NOT
+      // submit — the stored body still holds local file paths for those items
+      // and the server would reject them (or store an empty field). Mirrors the
+      // abort-on-failure guard the online submit path uses.
+      bool anyUploadFailed = false;
+
+      // Recover each item key -> server field id from the stored body so media
+      // uploaded on retry is tagged with the same itemId the online path sends.
+      // Falls back to the item key for legacy records saved before fieldId was
+      // persisted. (Images already carry their fieldId via PendingImage.itemId.)
+      final fieldIdByKey = <String, String>{};
+      final storedData = currentInspection.data['inspection_data'];
+      if (storedData is Map<String, dynamic>) {
+        for (final section in storedData.values) {
+          if (section is Map<String, dynamic>) {
+            final items = section['items'];
+            if (items is List) {
+              for (final item in items) {
+                if (item is Map<String, dynamic> && item['id'] != null) {
+                  final fid = item['fieldId'];
+                  if (fid != null && fid.toString().isNotEmpty) {
+                    fieldIdByKey[item['id'].toString()] = fid.toString();
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+
       // Upload pending images
       if (inspection.pendingImages.isNotEmpty) {
         state = state.copyWith(
@@ -840,6 +870,8 @@ class InspectionNotifier extends _$InspectionNotifier {
           final url = result['url'] as String?;
           if (result['success'] == true && url != null && url.isNotEmpty) {
             uploadedImages[entry.key] = url;
+          } else {
+            anyUploadFailed = true;
           }
         }
 
@@ -878,18 +910,21 @@ class InspectionNotifier extends _$InspectionNotifier {
       final int? uploadInspectionId =
           rawId is int ? rawId : int.tryParse(rawId?.toString() ?? '');
 
+      // `itemKey` is the local map key (item['id']); both the section titles and
+      // fieldIdByKey are keyed by it. The upload itself must be tagged with the
+      // server field id, otherwise the server can't place the media.
       Future<String?> uploadMedia(
-          String path, String fieldId, String mediaType) async {
-        final section = sectionTitles[fieldId] ?? '';
+          String path, String itemKey, String mediaType) async {
+        final section = sectionTitles[itemKey] ?? '';
         if (section.isEmpty) {
-          log('Retry upload: no section for field $fieldId; skipping.');
+          log('Retry upload: no section for field $itemKey; skipping.');
           return null;
         }
         final result = await ApiService.uploadImage(
           path,
           inspectionId: uploadInspectionId,
           section: section,
-          itemId: fieldId,
+          itemId: fieldIdByKey[itemKey] ?? itemKey,
           fieldName: 'image',
           mediaType: mediaType,
         );
@@ -897,28 +932,40 @@ class InspectionNotifier extends _$InspectionNotifier {
         if (result['success'] == true && url != null && url.isNotEmpty) {
           return url;
         }
-        log('Retry upload failed ($fieldId): ${result['message']}');
+        log('Retry upload failed ($itemKey): ${result['message']}');
         return null;
       }
 
       for (var entry in currentInspection.videos.entries) {
         if (!entry.value.startsWith('http')) {
           final url = await uploadMedia(entry.value, entry.key, 'video');
-          if (url != null) videoReplacements[entry.key] = url;
+          if (url != null) {
+            videoReplacements[entry.key] = url;
+          } else {
+            anyUploadFailed = true;
+          }
         }
       }
 
       for (var entry in currentInspection.audios.entries) {
         if (!entry.value.startsWith('http')) {
           final url = await uploadMedia(entry.value, entry.key, 'audio');
-          if (url != null) audioReplacements[entry.key] = url;
+          if (url != null) {
+            audioReplacements[entry.key] = url;
+          } else {
+            anyUploadFailed = true;
+          }
         }
       }
 
       for (var entry in currentInspection.files.entries) {
         if (!entry.value.startsWith('http')) {
           final url = await uploadMedia(entry.value, entry.key, 'file');
-          if (url != null) fileReplacements[entry.key] = url;
+          if (url != null) {
+            fileReplacements[entry.key] = url;
+          } else {
+            anyUploadFailed = true;
+          }
         }
       }
 
@@ -938,6 +985,7 @@ class InspectionNotifier extends _$InspectionNotifier {
             changed = true;
           } else {
             newList.add(p);
+            anyUploadFailed = true;
           }
         }
         if (changed) multiImageReplacements[entry.key] = newList;
@@ -948,7 +996,9 @@ class InspectionNotifier extends _$InspectionNotifier {
           audioReplacements.isNotEmpty ||
           fileReplacements.isNotEmpty ||
           multiImageReplacements.isNotEmpty) {
-        // Keyed by field id, matching the maps above. Looking these up by local
+        // Replacement maps are already keyed by the item key (the same key the
+        // videos/audios/files maps use), which is exactly what
+        // updateInspectionMedia's addAll expects. Looking these up by local
         // path instead silently produced empty maps, so a successful upload was
         // discarded and the next retry re-sent the whole file.
         await LocalStorageService.updateInspectionMedia(
@@ -958,6 +1008,18 @@ class InspectionNotifier extends _$InspectionNotifier {
           uploadedFiles: fileReplacements,
           uploadedMultiImages: multiImageReplacements,
         );
+      }
+
+      // At least one upload failed: keep the successfully-uploaded URLs we just
+      // persisted, but do NOT submit. The body still references local paths for
+      // the failed items, so submitting now would POST paths the server can't
+      // resolve — the exact failure that left media "stored locally only".
+      // Leave the record pending so a later retry finishes the remaining media.
+      if (anyUploadFailed) {
+        state = state.copyWith(
+          submittingStates: {...state.submittingStates, inspection.id: false},
+        );
+        return false;
       }
 
       // Build final submission payload with all uploaded URLs applied.
@@ -1028,14 +1090,28 @@ class InspectionNotifier extends _$InspectionNotifier {
 
       // Finalise the existing server draft by id when the stored body carries
       // one (it was initialized online before going offline), so reconnecting
-      // never creates a duplicate. Only create when there is no server id.
+      // never creates a duplicate. When there is no server id (the inspection was
+      // created entirely offline and never initialized), initialize a draft now
+      // to mint one, then finalise that — the legacy all-at-once create endpoint
+      // is no longer used.
       final rawServerId = inspectionData['inspection_id'];
-      final int? serverId = rawServerId is int
+      int? serverId = rawServerId is int
           ? rawServerId
           : int.tryParse(rawServerId?.toString() ?? '');
-      final result = serverId != null
-          ? await ApiService.submitInspectionById(serverId, inspectionData)
-          : await ApiService.submitInspection(inspectionData);
+      if (serverId == null) {
+        serverId = await _initializeDraftForOfflineBody(inspectionData);
+        if (serverId == null) {
+          // Could not mint a server id (missing brand/model or network) — keep
+          // the record for a later retry instead of dropping it.
+          state = state.copyWith(
+            submittingStates: {...state.submittingStates, inspection.id: false},
+          );
+          return false;
+        }
+        inspectionData['inspection_id'] = serverId;
+      }
+      final result =
+          await ApiService.submitInspectionById(serverId, inspectionData);
 
       if (result['success'] == true) {
         await LocalStorageService.markInspectionAsSubmitted(inspection.id);
@@ -1070,6 +1146,45 @@ class InspectionNotifier extends _$InspectionNotifier {
       );
       return false;
     }
+  }
+
+  /// Mints a server draft for an offline-created inspection that never had an
+  /// `inspection_id`, using the brand/model (and any vehicle details) carried in
+  /// its stored submission body. Returns the new id, or null when the body lacks
+  /// brand/model or initialize fails — the caller keeps the record for retry.
+  Future<int?> _initializeDraftForOfflineBody(
+      Map<String, dynamic> inspectionData) async {
+    int? asInt(dynamic v) =>
+        v is int ? v : int.tryParse(v?.toString() ?? '');
+    final brandId = asInt(inspectionData['vehicle_brand_id']);
+    final modelId = asInt(inspectionData['vehicle_model_id']);
+    if (brandId == null || modelId == null) {
+      log('Offline drain: missing brand/model id — cannot initialize draft');
+      return null;
+    }
+    String? str(dynamic v) {
+      final s = v?.toString();
+      return (s == null || s.isEmpty) ? null : s;
+    }
+
+    try {
+      final result = await ApiService.initializeInspection(
+        vehicleBrandId: brandId,
+        vehicleModelId: modelId,
+        year: str(inspectionData['year']),
+        variant: str(inspectionData['variant']),
+        colour: str(inspectionData['color']),
+        transmission: str(inspectionData['transmission']),
+        regNo: str(inspectionData['registration_number']),
+      );
+      if (result['success'] == true) {
+        return asInt(result['inspection_id']);
+      }
+      log('Offline drain: initialize failed — ${result['message']}');
+    } catch (e) {
+      log('Offline drain: initialize exception — $e');
+    }
+    return null;
   }
 
   Future<void> deleteInspection(String id) async {

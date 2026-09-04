@@ -206,7 +206,14 @@ class ReferenceMediaCache {
   /// open each field; navigating offline later finds every image on disk. Cached
   /// images persist across inspections (keyed by URL), so a new inspection that
   /// reuses an image gets an instant hit.
-  static Future<void> prefetch(Iterable<String> urls) async {
+  ///
+  /// [revalidate] controls whether already-cached files are checked against the
+  /// server. Pass true on first fetch (initialize) to pick up the latest guide
+  /// images; pass false when re-entering an existing draft so cached files are
+  /// trusted as-is and only missing ones download — otherwise every draft resume
+  /// re-downloads the whole set when the server omits ETag/Last-Modified.
+  static Future<void> prefetch(Iterable<String> urls,
+      {bool revalidate = true}) async {
     final unique = <String>{};
     for (final url in urls) {
       if (url.isNotEmpty) unique.add(url);
@@ -251,7 +258,7 @@ class ReferenceMediaCache {
         final i = next++;
         if (i >= list.length) break;
         try {
-          if (await warm(list[i], revalidate: true, client: client)) {
+          if (await warm(list[i], revalidate: revalidate, client: client)) {
             cached++;
           } else {
             failed++;

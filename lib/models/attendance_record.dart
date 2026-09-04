@@ -1,7 +1,12 @@
-/// A single attendance record from `GET /api/admin/attendance`.
+/// A single attendance record — one row per inspector per day.
 ///
-/// `type` is `available` (inspector marked themselves available for the day)
-/// or `working` (an active/closed work session with check-in/out times).
+/// Maps the inspector check-in/out endpoints (`POST /inspector/attendance/
+/// check-in`, `/check-out`, `GET /inspector/attendance`) and the admin list
+/// (`GET /admin/attendance`).
+///
+/// `type` is `available` (free day — inspector marked themselves present) or
+/// `working` (has bookings that day). The day stays "open" until [checkOut] is
+/// recorded; [workedMinutes] is server-computed and null while open.
 class AttendanceRecord {
   final int id;
   final int? inspectorId;
@@ -9,10 +14,21 @@ class AttendanceRecord {
   final String inspectorEmail;
   final String type;
   final DateTime? date;
+
+  // Check-in.
   final DateTime? checkIn;
-  final DateTime? checkOut;
   final double? latitude;
   final double? longitude;
+  final String? locationLabel;
+
+  // Check-out (all null while the day is still open).
+  final DateTime? checkOut;
+  final double? checkoutLatitude;
+  final double? checkoutLongitude;
+  final String? checkoutLocationLabel;
+
+  /// Server-computed worked minutes; null until the day is checked out.
+  final int? workedMinutes;
 
   const AttendanceRecord({
     required this.id,
@@ -22,17 +38,30 @@ class AttendanceRecord {
     required this.type,
     required this.date,
     required this.checkIn,
-    required this.checkOut,
     required this.latitude,
     required this.longitude,
+    required this.locationLabel,
+    required this.checkOut,
+    required this.checkoutLatitude,
+    required this.checkoutLongitude,
+    required this.checkoutLocationLabel,
+    required this.workedMinutes,
   });
 
   bool get isWorking => type.toLowerCase() == 'working';
   bool get isAvailable => type.toLowerCase() == 'available';
   bool get hasLocation => latitude != null && longitude != null;
+  bool get hasCheckoutLocation =>
+      checkoutLatitude != null && checkoutLongitude != null;
 
-  /// Worked duration when both check-in and check-out are present.
+  /// True once checked in but not yet checked out.
+  bool get isOpen => checkIn != null && checkOut == null;
+  bool get isCheckedOut => checkOut != null;
+
+  /// Worked duration. Prefers the server's [workedMinutes]; falls back to the
+  /// check-in→check-out delta when only timestamps are present.
   Duration? get duration {
+    if (workedMinutes != null) return Duration(minutes: workedMinutes!);
     if (checkIn == null || checkOut == null) return null;
     final d = checkOut!.difference(checkIn!);
     return d.isNegative ? null : d;
@@ -58,13 +87,23 @@ class AttendanceRecord {
               '')
           .toString(),
       type: (json['type'] ?? 'available').toString(),
-      date: AttendanceParse.toDate(json['date'] ?? json['created_at']),
+      date: AttendanceParse.toDate(
+          json['attendance_date'] ?? json['date'] ?? json['created_at']),
       checkIn: AttendanceParse.toDate(
-          json['check_in'] ?? json['checked_in_at'] ?? json['start_time']),
-      checkOut: AttendanceParse.toDate(
-          json['check_out'] ?? json['checked_out_at'] ?? json['end_time']),
+          json['checked_in_at'] ?? json['check_in']),
       latitude: AttendanceParse.toDouble(json['latitude'] ?? json['lat']),
       longitude: AttendanceParse.toDouble(json['longitude'] ?? json['lng']),
+      locationLabel:
+          AttendanceParse.toNullableString(json['location_label']),
+      checkOut: AttendanceParse.toDate(
+          json['checked_out_at'] ?? json['check_out']),
+      checkoutLatitude:
+          AttendanceParse.toDouble(json['checkout_latitude']),
+      checkoutLongitude:
+          AttendanceParse.toDouble(json['checkout_longitude']),
+      checkoutLocationLabel:
+          AttendanceParse.toNullableString(json['checkout_location_label']),
+      workedMinutes: AttendanceParse.toInt(json['worked_minutes']),
     );
   }
 }

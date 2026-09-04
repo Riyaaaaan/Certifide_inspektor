@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "521293637298",
+    "project_id": "certifide-inspektor",
+    "storage_bucket": "certifide-inspektor.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:521293637298:android:b4785d22f4976636f20bab",
+        "android_client_info": {
+          "package_name": "com.certifide.inspektor"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyAyzhUvV3LXWDFEuM7mn9MQJIF4hEBZThs"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

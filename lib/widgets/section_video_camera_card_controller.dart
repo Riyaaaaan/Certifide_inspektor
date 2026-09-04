@@ -297,8 +297,15 @@ class VideoCardController extends _$VideoCardController
 
     final controller = CameraController(
       camera,
+      // 1080p capture. Encoder compresses in real time to the bitrate below,
+      // so the file is born small — no post-capture compression step needed.
       _videoResolution,
       enableAudio: true,
+      fps: 30,
+      // ~5 Mbps: high quality at 1080p30, ~38 MB/min. Default recorder runs
+      // 12-20 Mbps. Tune up for sharper / down for smaller uploads.
+      videoBitrate: 5000000,
+      audioBitrate: 128000,
     );
     _controller = controller;
 
@@ -362,7 +369,12 @@ class VideoCardController extends _$VideoCardController
     }
     _isToggling = true;
     try {
-      if (state.isRecording) {
+      // Stop if EITHER our own flag or the native recorder says we're
+      // recording. The two can briefly desync (e.g. a recording auto-stopped
+      // when the app was backgrounded, whose parent-UI flag never cleared);
+      // trusting the hardware guarantees Stop always stops an active capture
+      // instead of accidentally starting a new one.
+      if (state.isRecording || (_controller!.value.isRecordingVideo)) {
         await _stopRecording();
       } else {
         await _startRecording();
@@ -443,6 +455,7 @@ class VideoCardController extends _$VideoCardController
     // Guard against the native layer not actually recording.
     if (!(_controller?.value.isRecordingVideo ?? false)) {
       _set(state.copyWith(isRecording: false, isPaused: false));
+      _onRecordingChanged?.call(false);
       _onRecordingPausedChanged?.call(false);
       return;
     }
@@ -486,6 +499,7 @@ class VideoCardController extends _$VideoCardController
         await _controller?.stopVideoRecording();
       } catch (_) {}
       _set(state.copyWith(isRecording: false, isPaused: false));
+      _onRecordingChanged?.call(false);
       _onRecordingPausedChanged?.call(false);
     }
   }

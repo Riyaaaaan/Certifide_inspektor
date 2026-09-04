@@ -41,7 +41,9 @@
       "Bash(adb -s emulator-5554 shell input tap 513 1238)",
       "Bash(adb -s emulator-5554 shell input tap 300 1480)",
       "Bash(adb -s emulator-5554 shell input tap 513 1431)",
-      "Bash(adb -s emulator-5554 shell input tap 300 866)"
+      "Bash(adb -s emulator-5554 shell input tap 300 866)",
+      "Bash(flutter test *)",
+      "Bash(cd *)"
     ]
   }
 }

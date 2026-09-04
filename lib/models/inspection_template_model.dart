@@ -380,11 +380,95 @@ class InspectionInitializationResponse {
   final VehicleInfo vehicleInfo;
   final InspectionStructure structure;
 
+  /// Previously-saved answers and already-uploaded media URLs returned by
+  /// /resume under `saved_sections`, flattened to `{ itemId: {value, remarks,
+  /// image, multiImages, video, audio, file} }`. The server may carry resumed
+  /// data here instead of (or in addition to) per-field `initial_*`, so the
+  /// resume merge consults it to avoid dropping already-uploaded data.
+  final Map<String, Map<String, dynamic>> savedFields;
+
   InspectionInitializationResponse({
     required this.templateType,
     required this.vehicleInfo,
     required this.structure,
+    this.savedFields = const {},
   });
+
+  /// Tolerantly flattens the server `saved_sections` payload (shape unknown /
+  /// inconsistent across endpoints) into a flat `itemId -> normalized fields`
+  /// map. Accepts a list of sections (each with `items`/`fields`), a map keyed
+  /// by section, a flat list of items, or the already-flattened round-trip
+  /// shape this class' [toJson] emits.
+  static Map<String, Map<String, dynamic>> _parseSavedFields(dynamic raw) {
+    final out = <String, Map<String, dynamic>>{};
+    if (raw == null) return out;
+
+    String? str(dynamic v) {
+      if (v == null) return null;
+      if (v is Map) return (v['url'] ?? v['path'] ?? v['value'])?.toString();
+      final s = v.toString();
+      return s.isEmpty ? null : s;
+    }
+
+    List<String>? strList(dynamic v) {
+      if (v is! List) return null;
+      final list = <String>[];
+      for (final e in v) {
+        final s = e is Map
+            ? (e['url'] ?? e['path'] ?? e['imagePath'])?.toString()
+            : e?.toString();
+        if (s != null && s.isNotEmpty) list.add(s);
+      }
+      return list.isEmpty ? null : list;
+    }
+
+    void addItem(Map item) {
+      final id = (item['id'] ??
+              item['fieldId'] ??
+              item['field_id'] ??
+              item['uniqueId'] ??
+              item['unique_id'])
+          ?.toString();
+      if (id == null || id.isEmpty) return;
+      out[id] = {
+        'value': str(item['value']),
+        'remarks': str(item['remarks'] ?? item['remark']),
+        'image': str(item['imagePath'] ?? item['image'] ?? item['initial_image']),
+        'multiImages': strList(item['multiImages'] ?? item['multi_images']),
+        'video': str(item['videoPath'] ?? item['video']),
+        'audio': str(item['audioPath'] ?? item['audio']),
+        'file': str(item['filePath'] ?? item['file']),
+      };
+    }
+
+    void scan(dynamic node) {
+      if (node is List) {
+        for (final e in node) {
+          scan(e);
+        }
+      } else if (node is Map) {
+        final items = node['items'] ?? node['fields'];
+        if (items is List) {
+          for (final it in items) {
+            if (it is Map) addItem(it);
+          }
+        } else if (node.containsKey('id') ||
+            node.containsKey('fieldId') ||
+            node.containsKey('field_id')) {
+          // A bare field item (flat list, or the flattened round-trip shape).
+          addItem(node);
+        } else {
+          // A map keyed by section/id — recurse into the values.
+          for (final v in node.values) {
+            scan(v);
+          }
+        }
+      }
+    }
+
+    scan(raw);
+    return out;
+  }
 
   /// Flat list of every image reference-media URL across all sections/fields,
   /// for warming the offline cache. Excludes non-image media (video/audio are
@@ -406,6 +490,8 @@ class InspectionInitializationResponse {
           json['vehicle_info'] ?? json['vehicleInfo'] ?? {}),
       structure: InspectionStructure.fromJson(
           json['structure'] ?? {}),
+      savedFields:
+          _parseSavedFields(json['saved_sections'] ?? json['savedSections']),
     );
   }
 
@@ -414,6 +500,11 @@ class InspectionInitializationResponse {
       'template_type': templateType.toJson(),
       'vehicle_info': vehicleInfo.toJson(),
       'structure': structure.toJson(),
+      // Round-trip as a flat list of items (each carrying its id) so the offline
+      // Hive copy re-parses through the same path the server payload takes.
+      'saved_sections': [
+        for (final e in savedFields.entries) {'id': e.key, ...e.value},
+      ],
     };
   }
 }

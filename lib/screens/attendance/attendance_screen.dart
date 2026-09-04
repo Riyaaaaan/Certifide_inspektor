@@ -15,7 +15,7 @@ import 'leave_application_screen.dart';
 /// "Attendance — coming soon" banner. Flip to `true` to restore the full
 /// check-in/out page ([InspectorAttendanceScreen]) — nothing else needs to
 /// change.
-const bool kInspectorAttendanceEnabled = false;
+const bool kInspectorAttendanceEnabled = true;
 
 /// Entry point for the attendance tab. Admins get the management view wired to
 /// the admin leave/attendance API; inspectors get their own attendance page

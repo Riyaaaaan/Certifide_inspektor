@@ -13,6 +13,8 @@ import '../models/inspection_stats_model.dart';
 import '../models/inspection_template_model.dart';
 import '../models/inspector.dart';
 import '../models/attendance_record.dart';
+import '../models/booking.dart';
+import '../models/booking_query.dart';
 import '../models/inspector_leave.dart';
 import '../models/leave_request.dart';
 import '../models/pagination_data_model.dart';
@@ -125,7 +127,6 @@ class ApiService {
   static const String initializeDynamicInspectionEndPoint =
       '/dynamic-inspections/initialize';
   static const String getModelsEndpoint = '/admin/vehicles/models';
-  static const String submitDynamicInspectionEndPoint = '/dynamic-inspections';
   static const String newCarsEndPoint = '/cars/new';
   static const String userCarsEndPoint = '/cars/old';
   static const String carFiltersEndpoint = '/cars/filters';
@@ -136,6 +137,13 @@ class ApiService {
   static const String adminLeavesEndPoint = '/admin/leaves';
   static const String adminAttendanceEndPoint = '/admin/attendance';
   static const String inspectorLeavesEndPoint = '/inspector/leaves';
+  static const String inspectorBookingsEndPoint = '/inspector/bookings';
+  static const String inspectorAttendanceEndPoint = '/inspector/attendance';
+  // FCM device-token endpoints (any authenticated user; upsert keyed on the
+  // token via updateOrCreate on the backend).
+  static const String registerTokenEndPoint = '/notifications/register-token';
+  static const String unregisterTokenEndPoint =
+      '/notifications/unregister-token';
 
   static Future<Map<String, dynamic>> createInitialInspection(
       Map<String, dynamic> vehicleData) async {
@@ -1290,42 +1298,11 @@ class ApiService {
     };
   }
 
-  /// Legacy all-at-once create: POST /dynamic-inspections. Used only when there
-  /// is no server inspection id yet (the draft was never initialized). When an
-  /// id exists, prefer [submitInspectionById] so the existing draft is finalised
-  /// instead of a duplicate inspection being created.
-  static Future<Map<String, dynamic>> submitInspection(
-      Map<String, dynamic> body) async {
-    try {
-      log('Submitting dynamic inspection to: $baseUrl$submitDynamicInspectionEndPoint');
-      if (kDebugMode) log('Submission body: $body');
-
-      final response = await http.post(
-        Uri.parse('$baseUrl$submitDynamicInspectionEndPoint'),
-        headers: await _getHeaders(requiresAuth: true),
-        body: json.encode(body),
-      ).timeout(_requestTimeout);
-
-      log('Submit inspection response status: ${response.statusCode}');
-      if (kDebugMode) log('Submit inspection response body: ${response.body}');
-
-      return _parseSubmitResponse(response);
-    } on UnauthorizedException {
-      rethrow;
-    } catch (e) {
-      log('Error submitting inspection: $e');
-      return {
-        'success': false,
-        'message': 'Network error: ${e.toString()}',
-      };
-    }
-  }
-
   /// Finalises an existing draft: POST /dynamic-inspections/{id}/submit.
-  /// Sets processing_status = "completed". The data may already be on the server
-  /// (saved per-field via save-step); [body] is sent anyway so any field not yet
-  /// save-stepped (e.g. edited offline) is persisted in the same call. Idempotent
-  /// on an already-completed (un-approved) inspection.
+  /// Sets processing_status = "completed". The live flow save-steps every section
+  /// first and then calls this with an empty body ({}); the offline-drain path
+  /// passes the full stored body so anything not yet save-stepped is persisted in
+  /// the same call. Idempotent on an already-completed (un-approved) inspection.
   static Future<Map<String, dynamic>> submitInspectionById(
     int inspectionId,
     Map<String, dynamic> body,
@@ -1388,32 +1365,6 @@ class ApiService {
       return {'success': false, 'message': _handleError(response)};
     } catch (e) {
       log('Error saving inspection step: $e');
-      return {'success': false, 'message': 'Network error: ${e.toString()}'};
-    }
-  }
-
-  static Future<Map<String, dynamic>> updateDynamicInspection(
-    int inspectionId,
-    Map<String, dynamic> data,
-  ) async {
-    try {
-      final response = await http.put(
-        Uri.parse('$baseUrl$submitDynamicInspectionEndPoint/$inspectionId'),
-        headers: await _getHeaders(requiresAuth: true),
-        body: json.encode(data),
-      ).timeout(_requestTimeout);
-
-      if (response.statusCode == 200 || response.statusCode == 201) {
-        final responseData = json.decode(response.body);
-        return {
-          'success': true,
-          'data': responseData['data'],
-          'message': responseData['message'] ?? 'Updated successfully',
-        };
-      }
-      return {'success': false, 'message': _handleError(response)};
-    } catch (e) {
-      log('Error updating dynamic inspection: $e');
       return {'success': false, 'message': 'Network error: ${e.toString()}'};
     }
   }
@@ -1823,9 +1774,13 @@ class ApiService {
           }
 
           // Warm the offline cache for reference images (see initializeInspection).
+          // Resume only fetches images NOT already on disk — already-cached
+          // guides are trusted as-is so re-entering a draft doesn't re-download
+          // the whole set (initialize already revalidated them).
           if (inspectionResponse != null) {
             unawaited(ReferenceMediaCache.prefetch(
-                inspectionResponse.referenceImageUrls));
+                inspectionResponse.referenceImageUrls,
+                revalidate: false));
           }
 
           return {
@@ -2184,6 +2139,502 @@ class ApiService {
     } catch (e) {
       log('cancelLeave error: $e');
       return {'success': false, 'message': 'Network error: ${e.toString()}'};
+    }
+  }
+
+  // ─────────────────────────── Inspector: Bookings ────────────────────────
+
+  /// `GET /api/inspector/bookings` — the signed-in inspector's assigned jobs.
+  /// [filter] is `today` / `upcoming` / `past` / `all`. Returns
+  /// `{success, bookings: List<Booking>, pagination, message}`.
+  static Future<Map<String, dynamic>> getInspectorBookings({
+    String filter = 'all',
+    int page = 1,
+    int perPage = 15,
+  }) async {
+    final params = <String, String>{
+      'filter': filter,
+      'page': '$page',
+      'per_page': '$perPage',
+    };
+    final uri = Uri.parse('$baseUrl$inspectorBookingsEndPoint')
+        .replace(queryParameters: params);
+    try {
+      final response = await http
+          .get(uri, headers: await _getHeaders(requiresAuth: true))
+          .timeout(_requestTimeout);
+
+      if (response.statusCode == 200) {
+        final responseData = json.decode(response.body) as Map<String, dynamic>;
+        final rawList = _extractList(responseData, 'bookings');
+        final bookings = rawList
+            .whereType<Map>()
+            .map((e) => Booking.fromJson(e.cast<String, dynamic>()))
+            .toList();
+        return {
+          'success': true,
+          'bookings': bookings,
+          'pagination':
+              _extractPagination(responseData, _dataMap(responseData)),
+          'message': 'Bookings retrieved successfully',
+        };
+      }
+      return {'success': false, 'message': _handleError(response)};
+    } on UnauthorizedException {
+      return {'success': false, 'message': 'Session expired. Please login again.'};
+    } catch (e) {
+      log('getInspectorBookings error: $e');
+      return {'success': false, 'message': 'Network error: ${e.toString()}'};
+    }
+  }
+
+  /// `GET /api/inspector/bookings/{id}` — full detail incl. the `queries` array.
+  /// Returns `{success, booking: Booking, message}`.
+  static Future<Map<String, dynamic>> getInspectorBookingDetail(
+      int bookingId) async {
+    final uri = Uri.parse('$baseUrl$inspectorBookingsEndPoint/$bookingId');
+    try {
+      final response = await http
+          .get(uri, headers: await _getHeaders(requiresAuth: true))
+          .timeout(_requestTimeout);
+
+      if (response.statusCode == 200) {
+        final responseData = json.decode(response.body) as Map<String, dynamic>;
+        final data = _dataMap(responseData);
+        return {
+          'success': true,
+          'booking': Booking.fromJson(data),
+          'message': 'Booking retrieved successfully',
+        };
+      }
+      return {'success': false, 'message': _handleError(response)};
+    } on UnauthorizedException {
+      return {'success': false, 'message': 'Session expired. Please login again.'};
+    } catch (e) {
+      log('getInspectorBookingDetail error: $e');
+      return {'success': false, 'message': 'Network error: ${e.toString()}'};
+    }
+  }
+
+  /// `POST /api/inspector/bookings/{id}/whatsapp-intimation` — upload the WA
+  /// proof screenshot. Returns `{success, whatsappScreenshotUrl, message}`.
+  static Future<Map<String, dynamic>> uploadWhatsappIntimation(
+    int bookingId,
+    String imagePath,
+  ) =>
+      _uploadBookingScreenshot(
+        '$inspectorBookingsEndPoint/$bookingId/whatsapp-intimation',
+        imagePath,
+        successUrlKey: 'whatsapp_screenshot_url',
+        resultKey: 'whatsappScreenshotUrl',
+      );
+
+  /// `POST /api/inspector/bookings/{id}/report-screenshot` — upload a screenshot
+  /// of the submitted report. Returns `{success, reportScreenshotUrl, message}`.
+  static Future<Map<String, dynamic>> uploadReportScreenshot(
+    int bookingId,
+    String imagePath,
+  ) =>
+      _uploadBookingScreenshot(
+        '$inspectorBookingsEndPoint/$bookingId/report-screenshot',
+        imagePath,
+        successUrlKey: 'report_screenshot_url',
+        resultKey: 'reportScreenshotUrl',
+      );
+
+  /// Shared multipart uploader for the two booking screenshot endpoints. Field
+  /// name is `screenshot` per spec; refreshes + retries once on a 401.
+  static Future<Map<String, dynamic>> _uploadBookingScreenshot(
+    String endpoint,
+    String imagePath, {
+    required String successUrlKey,
+    required String resultKey,
+  }) async {
+    try {
+      final file = File(imagePath);
+      if (!await file.exists()) {
+        return {'success': false, 'message': 'File not found'};
+      }
+      final bytes = await file.readAsBytes();
+      final fileName = imagePath.split('/').last;
+
+      Future<({int status, String body})> send() async {
+        final authToken = await _storage.read(key: 'jwt_token');
+        if (authToken == null) throw const _SessionExpired();
+        final request =
+            http.MultipartRequest('POST', Uri.parse('$baseUrl$endpoint'));
+        request.headers['Authorization'] = 'Bearer $authToken';
+        request.headers['Accept'] = 'application/json';
+        request.files.add(
+          http.MultipartFile.fromBytes('screenshot', bytes,
+              filename: fileName),
+        );
+        final response = await request.send().timeout(_requestTimeout);
+        final body = await response.stream.bytesToString();
+        return (status: response.statusCode, body: body);
+      }
+
+      ({int status, String body}) result;
+      try {
+        result = await send();
+        if (result.status == 401) {
+          final refreshResult = await refreshToken();
+          if (!refreshResult['success']) {
+            await _storage.deleteAll();
+            return {
+              'success': false,
+              'message': 'Session expired. Please login again.'
+            };
+          }
+          result = await send();
+        }
+      } on _SessionExpired {
+        return {
+          'success': false,
+          'message': 'Session expired. Please login again.'
+        };
+      }
+
+      if (result.status == 200 || result.status == 201) {
+        final responseData = json.decode(result.body) as Map<String, dynamic>;
+        final data = _dataMap(responseData);
+        return {
+          'success': true,
+          resultKey: AttendanceParse.toNullableString(data[successUrlKey]),
+          'message':
+              responseData['message']?.toString() ?? 'Uploaded successfully',
+        };
+      }
+      return {
+        'success': false,
+        'message': _handleErrorFromString(result.body, result.status),
+      };
+    } catch (e) {
+      log('_uploadBookingScreenshot($endpoint) error: $e');
+      return {'success': false, 'message': 'Network error: ${e.toString()}'};
+    }
+  }
+
+  /// `POST /api/inspector/bookings/{id}/mark-arrived` — records arrival time and
+  /// (best-effort, server-side) marks the day's attendance as `working`. All
+  /// location fields are optional. Returns `{success, arrivedAt, message}`.
+  static Future<Map<String, dynamic>> markArrived(
+    int bookingId, {
+    double? latitude,
+    double? longitude,
+    String? locationLabel,
+  }) async {
+    final uri =
+        Uri.parse('$baseUrl$inspectorBookingsEndPoint/$bookingId/mark-arrived');
+    try {
+      final response = await http
+          .post(
+            uri,
+            headers: await _getHeaders(requiresAuth: true),
+            body: json.encode({
+              if (latitude != null) 'latitude': latitude,
+              if (longitude != null) 'longitude': longitude,
+              if (locationLabel != null && locationLabel.trim().isNotEmpty)
+                'location_label': locationLabel.trim(),
+            }),
+          )
+          .timeout(_requestTimeout);
+
+      if (response.statusCode == 200 || response.statusCode == 201) {
+        final responseData = json.decode(response.body) as Map<String, dynamic>;
+        final data = _dataMap(responseData);
+        return {
+          'success': true,
+          'arrivedAt': AttendanceParse.toDate(data['arrived_at']),
+          'message':
+              responseData['message']?.toString() ?? 'Arrival time recorded.',
+        };
+      }
+      return {'success': false, 'message': _handleError(response)};
+    } on UnauthorizedException {
+      return {'success': false, 'message': 'Session expired. Please login again.'};
+    } catch (e) {
+      log('markArrived error: $e');
+      return {'success': false, 'message': 'Network error: ${e.toString()}'};
+    }
+  }
+
+  /// `POST /api/inspector/bookings/{id}/mark-inspection-started`.
+  static Future<Map<String, dynamic>> markInspectionStarted(int bookingId) =>
+      _bookingWorkflowPost(
+        '$inspectorBookingsEndPoint/$bookingId/mark-inspection-started',
+        defaultMessage: 'Inspection start time recorded.',
+      );
+
+  /// `POST /api/inspector/bookings/{id}/mark-inspection-completed` — returns the
+  /// computed `inspection_duration_minutes` in `data`.
+  static Future<Map<String, dynamic>> markInspectionCompleted(int bookingId) =>
+      _bookingWorkflowPost(
+        '$inspectorBookingsEndPoint/$bookingId/mark-inspection-completed',
+        defaultMessage: 'Inspection completion time recorded.',
+      );
+
+  /// Shared no-body POST for the two mark-inspection-* endpoints. Returns
+  /// `{success, data, message}` where `data` is the raw response payload.
+  static Future<Map<String, dynamic>> _bookingWorkflowPost(
+    String endpoint, {
+    required String defaultMessage,
+  }) async {
+    final uri = Uri.parse('$baseUrl$endpoint');
+    try {
+      final response = await http
+          .post(uri, headers: await _getHeaders(requiresAuth: true))
+          .timeout(_requestTimeout);
+
+      if (response.statusCode == 200 || response.statusCode == 201) {
+        final responseData = json.decode(response.body) as Map<String, dynamic>;
+        return {
+          'success': true,
+          'data': _dataMap(responseData),
+          'message': responseData['message']?.toString() ?? defaultMessage,
+        };
+      }
+      return {'success': false, 'message': _handleError(response)};
+    } on UnauthorizedException {
+      return {'success': false, 'message': 'Session expired. Please login again.'};
+    } catch (e) {
+      log('_bookingWorkflowPost($endpoint) error: $e');
+      return {'success': false, 'message': 'Network error: ${e.toString()}'};
+    }
+  }
+
+  /// `GET /api/inspector/bookings/{id}/queries` — the query thread for a booking.
+  /// Returns `{success, queries: List<BookingQuery>, message}`.
+  static Future<Map<String, dynamic>> getBookingQueries(int bookingId) async {
+    final uri =
+        Uri.parse('$baseUrl$inspectorBookingsEndPoint/$bookingId/queries');
+    try {
+      final response = await http
+          .get(uri, headers: await _getHeaders(requiresAuth: true))
+          .timeout(_requestTimeout);
+
+      if (response.statusCode == 200) {
+        final responseData = json.decode(response.body) as Map<String, dynamic>;
+        final rawList = _extractList(responseData, 'queries');
+        final queries = rawList
+            .whereType<Map>()
+            .map((e) => BookingQuery.fromJson(e.cast<String, dynamic>()))
+            .toList();
+        return {
+          'success': true,
+          'queries': queries,
+          'message': 'Queries retrieved successfully',
+        };
+      }
+      return {'success': false, 'message': _handleError(response)};
+    } on UnauthorizedException {
+      return {'success': false, 'message': 'Session expired. Please login again.'};
+    } catch (e) {
+      log('getBookingQueries error: $e');
+      return {'success': false, 'message': 'Network error: ${e.toString()}'};
+    }
+  }
+
+  /// `POST /api/inspector/bookings/{id}/queries` — raise a new query with admin.
+  /// Returns `{success, query: BookingQuery, message}`.
+  static Future<Map<String, dynamic>> submitBookingQuery(
+    int bookingId,
+    String message,
+  ) async {
+    final uri =
+        Uri.parse('$baseUrl$inspectorBookingsEndPoint/$bookingId/queries');
+    try {
+      final response = await http
+          .post(
+            uri,
+            headers: await _getHeaders(requiresAuth: true),
+            body: json.encode({'message': message.trim()}),
+          )
+          .timeout(_requestTimeout);
+
+      if (response.statusCode == 200 || response.statusCode == 201) {
+        final responseData = json.decode(response.body) as Map<String, dynamic>;
+        final data = responseData['data'];
+        return {
+          'success': true,
+          'query': data is Map
+              ? BookingQuery.fromJson(data.cast<String, dynamic>())
+              : null,
+          'message': responseData['message']?.toString() ?? 'Query submitted.',
+        };
+      }
+      return {'success': false, 'message': _handleError(response)};
+    } on UnauthorizedException {
+      return {'success': false, 'message': 'Session expired. Please login again.'};
+    } catch (e) {
+      log('submitBookingQuery error: $e');
+      return {'success': false, 'message': 'Network error: ${e.toString()}'};
+    }
+  }
+
+  // ────────────────────────── Inspector: Attendance ───────────────────────
+
+  /// `POST /api/inspector/attendance/check-in` — mark present for the day and
+  /// share location. Server decides `type` (`available`/`working`). Returns
+  /// `{success, record: AttendanceRecord, alreadyCheckedIn, message}`. On a
+  /// 422 (already checked in today) `alreadyCheckedIn` is true.
+  static Future<Map<String, dynamic>> checkInAttendance({
+    double? latitude,
+    double? longitude,
+    String? locationLabel,
+  }) =>
+      _attendancePunch('check-in', latitude, longitude, locationLabel,
+          defaultMessage: 'Attendance recorded.');
+
+  /// `POST /api/inspector/attendance/check-out` — ends the working day. Requires
+  /// an existing check-in. Returns the same shape as [checkInAttendance]; a 422
+  /// (no check-in / already checked out) sets `alreadyCheckedIn` true.
+  static Future<Map<String, dynamic>> checkOutAttendance({
+    double? latitude,
+    double? longitude,
+    String? locationLabel,
+  }) =>
+      _attendancePunch('check-out', latitude, longitude, locationLabel,
+          defaultMessage: 'Check-out recorded.');
+
+  static Future<Map<String, dynamic>> _attendancePunch(
+    String action,
+    double? latitude,
+    double? longitude,
+    String? locationLabel, {
+    required String defaultMessage,
+  }) async {
+    final uri = Uri.parse('$baseUrl$inspectorAttendanceEndPoint/$action');
+    try {
+      final response = await http
+          .post(
+            uri,
+            headers: await _getHeaders(requiresAuth: true),
+            body: json.encode({
+              if (latitude != null) 'latitude': latitude,
+              if (longitude != null) 'longitude': longitude,
+              if (locationLabel != null && locationLabel.trim().isNotEmpty)
+                'location_label': locationLabel.trim(),
+            }),
+          )
+          .timeout(_requestTimeout);
+
+      if (response.statusCode == 200 || response.statusCode == 201) {
+        final responseData = json.decode(response.body) as Map<String, dynamic>;
+        final data = _dataMap(responseData);
+        return {
+          'success': true,
+          'record': AttendanceRecord.fromJson(data),
+          'message': responseData['message']?.toString() ?? defaultMessage,
+        };
+      }
+      return {
+        'success': false,
+        'alreadyCheckedIn': response.statusCode == 422,
+        'message': _handleError(response),
+      };
+    } on UnauthorizedException {
+      return {'success': false, 'message': 'Session expired. Please login again.'};
+    } catch (e) {
+      log('_attendancePunch($action) error: $e');
+      return {'success': false, 'message': 'Network error: ${e.toString()}'};
+    }
+  }
+
+  /// `GET /api/inspector/attendance` — the inspector's own attendance history.
+  /// [month] is `YYYY-MM`. Returns
+  /// `{success, records: List<AttendanceRecord>, pagination, message}`.
+  static Future<Map<String, dynamic>> getInspectorAttendance({
+    String? month,
+    int page = 1,
+    int perPage = 31,
+  }) async {
+    final params = <String, String>{
+      'page': '$page',
+      'per_page': '$perPage',
+    };
+    if (month != null && month.isNotEmpty) params['month'] = month;
+
+    final uri = Uri.parse('$baseUrl$inspectorAttendanceEndPoint')
+        .replace(queryParameters: params);
+    try {
+      final response = await http
+          .get(uri, headers: await _getHeaders(requiresAuth: true))
+          .timeout(_requestTimeout);
+
+      if (response.statusCode == 200) {
+        final responseData = json.decode(response.body) as Map<String, dynamic>;
+        final rawList = _extractList(responseData, 'attendance');
+        final records = rawList
+            .whereType<Map>()
+            .map((e) => AttendanceRecord.fromJson(e.cast<String, dynamic>()))
+            .toList();
+        return {
+          'success': true,
+          'records': records,
+          'pagination':
+              _extractPagination(responseData, _dataMap(responseData)),
+          'message': 'Attendance retrieved successfully',
+        };
+      }
+      return {'success': false, 'message': _handleError(response)};
+    } on UnauthorizedException {
+      return {'success': false, 'message': 'Session expired. Please login again.'};
+    } catch (e) {
+      log('getInspectorAttendance error: $e');
+      return {'success': false, 'message': 'Network error: ${e.toString()}'};
+    }
+  }
+
+  // ──────────────────────────── Device tokens (FCM) ───────────────────────
+
+  /// `POST /api/notifications/register-token` — registers/updates this device's
+  /// FCM token so the backend can push to it (upsert keyed on the token).
+  /// [platform] is `android`/`ios`; [deviceId] is optional. Best-effort — never
+  /// throws.
+  static Future<bool> registerDeviceToken(
+    String token, {
+    required String platform,
+    String? deviceId,
+  }) async {
+    try {
+      final response = await http
+          .post(
+            Uri.parse('$baseUrl$registerTokenEndPoint'),
+            headers: await _getHeaders(requiresAuth: true),
+            body: json.encode({
+              'device_token': token,
+              'platform': platform,
+              if (deviceId != null && deviceId.isNotEmpty) 'device_id': deviceId,
+            }),
+          )
+          .timeout(_requestTimeout);
+      final ok = response.statusCode >= 200 && response.statusCode < 300;
+      if (!ok) log('registerDeviceToken failed: ${response.statusCode}');
+      return ok;
+    } catch (e) {
+      log('registerDeviceToken error: $e');
+      return false;
+    }
+  }
+
+  /// `DELETE /api/notifications/unregister-token` — removes this device's token
+  /// (call on logout). Best-effort — never throws.
+  static Future<bool> unregisterDeviceToken(String token) async {
+    try {
+      final response = await http
+          .delete(
+            Uri.parse('$baseUrl$unregisterTokenEndPoint'),
+            headers: await _getHeaders(requiresAuth: true),
+            body: json.encode({'device_token': token}),
+          )
+          .timeout(_requestTimeout);
+      final ok = response.statusCode >= 200 && response.statusCode < 300;
+      if (!ok) log('unregisterDeviceToken failed: ${response.statusCode}');
+      return ok;
+    } catch (e) {
+      log('unregisterDeviceToken error: $e');
+      return false;
     }
   }
 

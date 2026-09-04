@@ -48,29 +48,35 @@ import 'inspection_success_page.dart';
 // Receives plain-data input, returns the serialized template + copied maps.
 Map<String, dynamic> _buildStoragePayload(Map<String, dynamic> input) {
   final itemValues = Map<String, String>.from(
-      (input['itemValues'] as Map? ?? {}).map((k, v) => MapEntry(k.toString(), v.toString())));
+      (input['itemValues'] as Map? ?? {})
+          .map((k, v) => MapEntry(k.toString(), v.toString())));
   final itemImages = Map<String, String?>.from(
-      (input['itemImages'] as Map? ?? {}).map((k, v) => MapEntry(k.toString(), v as String?)));
+      (input['itemImages'] as Map? ?? {})
+          .map((k, v) => MapEntry(k.toString(), v as String?)));
   final itemVideos = Map<String, String?>.from(
-      (input['itemVideos'] as Map? ?? {}).map((k, v) => MapEntry(k.toString(), v as String?)));
+      (input['itemVideos'] as Map? ?? {})
+          .map((k, v) => MapEntry(k.toString(), v as String?)));
   final itemAudios = Map<String, String?>.from(
-      (input['itemAudios'] as Map? ?? {}).map((k, v) => MapEntry(k.toString(), v as String?)));
-  final itemFiles = Map<String, String?>.from(
-      (input['itemFiles'] as Map? ?? {}).map((k, v) => MapEntry(k.toString(), v as String?)));
+      (input['itemAudios'] as Map? ?? {})
+          .map((k, v) => MapEntry(k.toString(), v as String?)));
+  final itemFiles = Map<String, String?>.from((input['itemFiles'] as Map? ?? {})
+      .map((k, v) => MapEntry(k.toString(), v as String?)));
   final itemRemarks = Map<String, String>.from(
-      (input['itemRemarks'] as Map? ?? {}).map((k, v) => MapEntry(k.toString(), v.toString())));
+      (input['itemRemarks'] as Map? ?? {})
+          .map((k, v) => MapEntry(k.toString(), v.toString())));
   final textFieldValues = Map<String, String>.from(
-      (input['textFieldValues'] as Map? ?? {}).map((k, v) => MapEntry(k.toString(), v.toString())));
+      (input['textFieldValues'] as Map? ?? {})
+          .map((k, v) => MapEntry(k.toString(), v.toString())));
   final rawMultiImages = input['multiImages'] as Map?;
   final multiImages = rawMultiImages == null
       ? null
-      : Map<String, List<String>>.from(rawMultiImages.map((k, v) =>
-          MapEntry(k.toString(), (v as List).map((e) => e.toString()).toList())));
+      : Map<String, List<String>>.from(rawMultiImages.map((k, v) => MapEntry(
+          k.toString(), (v as List).map((e) => e.toString()).toList())));
   final rawFlaggedIssues = input['itemFlaggedIssues'] as Map?;
   final itemFlaggedIssues = rawFlaggedIssues == null
       ? <String, List<String>>{}
-      : Map<String, List<String>>.from(rawFlaggedIssues.map((k, v) =>
-          MapEntry(k.toString(), (v as List).map((e) => e.toString()).toList())));
+      : Map<String, List<String>>.from(rawFlaggedIssues.map((k, v) => MapEntry(
+          k.toString(), (v as List).map((e) => e.toString()).toList())));
   return {
     'itemValues': itemValues,
     'itemImages': itemImages,
@@ -226,7 +232,13 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
   // they fill it in or navigate away.
   final ValueNotifier<String?> _highlightMissingFieldId =
       ValueNotifier<String?>(null);
-  bool _isSyncingToServer = false;
+
+  // Section slugs whose fields changed since the last server save. Edits mark
+  // their section dirty (instead of POSTing each field); the whole section is
+  // save-stepped on leaving it (and as part of submit). Keeps requests batched
+  // per section rather than one-per-field. See [_flushDirtySectionsToServer].
+  final Set<String> _dirtySectionNames = {};
+  bool _isFlushingSections = false;
 
   // Dynamic inspection template from API
   InspectionInitializationResponse? _inspectionTemplate;
@@ -256,8 +268,7 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
 
     final id = _effectiveInspectionId;
     final now = DateTime.now();
-    final ts =
-        '${now.year.toString().padLeft(4, '0')}-'
+    final ts = '${now.year.toString().padLeft(4, '0')}-'
         '${now.month.toString().padLeft(2, '0')}-'
         '${now.day.toString().padLeft(2, '0')}_'
         '${now.hour.toString().padLeft(2, '0')}-'
@@ -361,7 +372,8 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
       'hasVideo': field.hasVideo,
       'hasFile': field.hasFile,
       'allowMultiImage': useMultiImage,
-      'useTextField': fieldType == 'text' || fieldType == 'date' || useMultiImage,
+      'useTextField':
+          fieldType == 'text' || fieldType == 'date' || useMultiImage,
       'options': field.options
           .map((opt) => {
                 'id': opt.id,
@@ -420,15 +432,48 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
       // inspection works even when CURRENT holds a different one (e.g. an
       // offline resume from the reports list). Fall back to CURRENT for data
       // saved before per-id keys existed.
-      final storedForResume = (widget.inspectionId != null
-              ? _inspectionBox?.get(
-                  HiveConstants.inspectionKey(widget.inspectionId!))
-              : null) ??
+      // Prefer the durable per-inspection slot; fall back to the shared CURRENT
+      // slot for data saved before per-id keys existed (or when the id stored at
+      // initialize differs from the id the resume passes).
+      final perIdStored = widget.inspectionId != null
+          ? _inspectionBox
+              ?.get(HiveConstants.inspectionKey(widget.inspectionId!))
+          : null;
+      final currentStored =
           _inspectionBox?.get(HiveConstants.CURRENT_INSPECTION_KEY);
+
+      // A resume must NOT hinge on the stored inspectionId equalling the resume
+      // id. The per-id slot is only written once the server id is known, so when
+      // a new inspection was started without one surfacing (inspectionId stored
+      // as null), no per-id slot exists and CURRENT holds the only copy. The old
+      // gate required CURRENT.inspectionId == widget.inspectionId, which a null
+      // id never satisfies — so it fell through to the fresh-start branch that
+      // DELETES the working copy, wiping every entered value, remark and image.
+      //
+      // Resume from CURRENT when it plausibly belongs to this inspection — its
+      // stored id is null (never stamped) or matches — and carries real data. A
+      // genuinely new inspection has CURRENT cleared before launch, so it still
+      // takes the fresh path; a different unfinished draft (CURRENT.inspectionId
+      // set to another id) is never loaded here.
+      bool hasSavedData(InspectionStorageModel? m) =>
+          m != null &&
+          !m.isCompleted &&
+          m.status != 'submitted' &&
+          (m.itemValues.isNotEmpty ||
+              m.itemImages.isNotEmpty ||
+              m.itemRemarks.isNotEmpty ||
+              m.itemVideos.isNotEmpty ||
+              m.itemAudios.isNotEmpty ||
+              m.itemFiles.isNotEmpty ||
+              (m.multiImages?.isNotEmpty ?? false) ||
+              m.textFieldValues.isNotEmpty);
+      final currentBelongsHere = currentStored != null &&
+          (currentStored.inspectionId == null ||
+              currentStored.inspectionId == widget.inspectionId);
       final resumesLocalCopy = widget.isNewInspection &&
           widget.inspectionId != null &&
-          storedForResume != null &&
-          storedForResume.inspectionId == widget.inspectionId;
+          (perIdStored != null ||
+              (currentBelongsHere && hasSavedData(currentStored)));
 
       if (widget.isNewInspection && !resumesLocalCopy) {
         // Fresh start — discard any leftover session from a previous run.
@@ -540,6 +585,27 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
         if (mounted && await _rehydratePendingMediaFromQueue() && mounted) {
           await _saveDataLocally();
         }
+      }
+
+      // Resume only: push any still-local media for this inspection to the
+      // server now, instead of waiting for a connectivity flip or the Pending
+      // tab. _commitPendingMediaToQueue queues just the un-uploaded local files
+      // (already-uploaded http URLs are skipped); the provider then uploads them
+      // and replays each field's save-step so the server keeps the media even if
+      // the app is stopped again. The queue keeps the local files, so the open
+      // form still displays them. Online-gated, fire-and-forget.
+      final isFreshStart = widget.isNewInspection && !resumesLocalCopy;
+      if (!isFreshStart && _effectiveInspectionId != null) {
+        unawaited(Future(() async {
+          try {
+            if (!await ConnectivityChecker.canReachServer()) return;
+            await _commitPendingMediaToQueue();
+            if (!mounted) return;
+            await ref.read(inspectionProvider.notifier).refreshMediaQueue();
+          } catch (e) {
+            log('Resume media upload trigger failed: $e');
+          }
+        }));
       }
 
       // Request camera + mic permissions while the loading screen is still
@@ -670,8 +736,10 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
         );
 
         final historyBox = Hive.isBoxOpen(HiveConstants.INSPECTION_HISTORY_BOX)
-            ? Hive.box<InspectionStorageModel>(HiveConstants.INSPECTION_HISTORY_BOX)
-            : await Hive.openBox<InspectionStorageModel>(HiveConstants.INSPECTION_HISTORY_BOX);
+            ? Hive.box<InspectionStorageModel>(
+                HiveConstants.INSPECTION_HISTORY_BOX)
+            : await Hive.openBox<InspectionStorageModel>(
+                HiveConstants.INSPECTION_HISTORY_BOX);
 
         await historyBox.add(completedInspection);
         await _inspectionBox?.delete(HiveConstants.CURRENT_INSPECTION_KEY);
@@ -704,6 +772,7 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
     final items = <Map<String, dynamic>>[];
     for (var item in section['items'] as List<dynamic>) {
       final uniqueId = _getItemUniqueId(item);
+      final fieldId = _getItemFieldId(item);
       final title = _getItemTitle(item);
 
       String value = itemValues[uniqueId] ?? '';
@@ -753,6 +822,10 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
 
       items.add({
         'id': uniqueId,
+        // Server field id, kept alongside the unique key so an offline record
+        // can tag its media uploads with the same itemId the online path uses
+        // when it is retried later (uniqueId != fieldId for templated items).
+        'fieldId': fieldId,
         'title': title,
         'value': value,
         'remarks': (remarks != null && remarks.isNotEmpty) ? remarks : null,
@@ -782,126 +855,147 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
     return false;
   }
 
-  /// Bulk fallback: saves all filled sections to the server (e.g. on explicit request).
-  /// Normal flow uses [_saveFieldToServer] for per-field instant saves.
-  // ignore: unused_element
-  void _syncToServer() {
+  /// The server section slug for a built section map (its `name`, falling back
+  /// to a slugified title). This is the value sent as `section` in save-step.
+  String _sectionSlug(Map<String, dynamic> section) =>
+      (section['name'] as String?) ??
+      (section['title'] as String).toLowerCase().replaceAll(' ', '_');
+
+  /// Marks the section that owns [uniqueId] dirty so it is save-stepped (as a
+  /// whole section) the next time the user leaves it, or on submit.
+  ///
+  /// Replaces the old per-field instant POST: instead of one save-step request
+  /// per field edit, edits accumulate and the entire section is sent once on
+  /// navigation. Kept under the original name so every call site (every value /
+  /// option / remark / media change) still simply "saves the field".
+  void _saveFieldToServer(dynamic item, String uniqueId) {
+    if (_effectiveInspectionId == null) return;
+    for (final sec in _sections) {
+      for (final si in sec['items'] as List<dynamic>) {
+        if (_getItemUniqueId(si) == uniqueId) {
+          _dirtySectionNames.add(_sectionSlug(sec));
+          return;
+        }
+      }
+    }
+  }
+
+  /// Fire-and-forget: save-step every dirty section to the server (online only),
+  /// clearing each from the dirty set on success. Called when leaving a section.
+  /// Only already-uploaded media (http URLs) is sent; still-local paths are left
+  /// for the offline media queue to upload and replay. See [_commitPendingMediaToQueue].
+  void _flushDirtySectionsToServer() {
     final inspectionId = _effectiveInspectionId;
-    if (inspectionId == null || _isSyncingToServer) return;
-    _isSyncingToServer = true;
+    if (inspectionId == null) return;
+    if (_dirtySectionNames.isEmpty || _isFlushingSections) return;
+    _isFlushingSections = true;
+
+    // Snapshot the dirty slugs and resolve them to sections up front.
+    final dirty = Set<String>.from(_dirtySectionNames);
+    final pending = <String, List<Map<String, dynamic>>>{};
+    for (final section in _sections) {
+      final slug = _sectionSlug(section);
+      if (!dirty.contains(slug)) continue;
+      pending[slug] = _buildSectionItems(section, httpOnly: true);
+    }
+
     unawaited(Future(() async {
       try {
-        final hasInternet = await ConnectivityChecker.canReachServer();
-        if (!hasInternet) return;
-
-        for (final section in _sections) {
-          if (!_sectionHasData(section)) continue;
-          final sectionName = (section['name'] as String?) ??
-              (section['title'] as String).toLowerCase().replaceAll(' ', '_');
-          final items = _buildSectionItems(section);
-          if (items.isEmpty) continue;
-          await ApiService.saveInspectionStep(
+        if (!await ConnectivityChecker.canReachServer()) return;
+        for (final entry in pending.entries) {
+          if (entry.value.isEmpty) {
+            _dirtySectionNames.remove(entry.key);
+            continue;
+          }
+          final r = await ApiService.saveInspectionStep(
             inspectionId,
-            section: sectionName,
-            items: items,
+            section: entry.key,
+            items: entry.value,
           );
+          if (r['success'] != false) _dirtySectionNames.remove(entry.key);
         }
       } catch (e) {
-        log('Background save-step sync error: $e');
+        log('Section flush save-step error: $e');
       } finally {
-        _isSyncingToServer = false;
+        _isFlushingSections = false;
       }
     }));
   }
 
-  /// Instantly uploads a single field's current data to the server via save-step.
-  /// Called whenever a field value, option, remark, or media changes.
-  void _saveFieldToServer(dynamic item, String uniqueId) {
-    final inspectionId = _effectiveInspectionId;
-    if (inspectionId == null) return;
-
-    // Locate the field's section by searching all sections
-    dynamic resolvedItem = item;
-    String? sectionName;
-    for (final sec in _sections) {
-      for (final si in sec['items'] as List<dynamic>) {
-        if (_getItemUniqueId(si) == uniqueId) {
-          resolvedItem ??= si;
-          sectionName = (sec['name'] as String?) ??
-              (sec['title'] as String).toLowerCase().replaceAll(' ', '_');
-          break;
-        }
-      }
-      if (sectionName != null) break;
-    }
-    if (resolvedItem == null || sectionName == null) return;
-
-    String value = itemValues[uniqueId] ?? '';
-    if (value == 'flagged' && (itemFlaggedIssues[uniqueId] ?? []).isEmpty) {
-      value = '';
-    } else if (value == 'flagged') {
-      final selectedLabel = itemFlaggedIssues[uniqueId]!.first;
-      if (resolvedItem is Map) {
-        final opts = resolvedItem['options'] as List?;
-        if (opts != null) {
-          for (final opt in opts) {
-            final lbl = opt['label']?.toString() ?? '';
-            final val = opt['value']?.toString() ?? '';
-            final label = lbl.isNotEmpty ? lbl : val;
-            if (label == selectedLabel) {
-              value = val.isNotEmpty ? val : label;
-              break;
-            }
-          }
-        }
-      }
-    }
-
-    String? filePath;
-    final filePayload = itemFiles[uniqueId];
-    if (filePayload != null) {
+  /// Awaitable, used by submit: save-step every section that has data so the
+  /// server holds the complete inspection before it is finalised with an empty
+  /// body. Returns the titles of any sections whose save failed, so the caller
+  /// can block submission rather than finalise an incomplete record. Only
+  /// http-URL media is sent (caller uploads remaining local media first).
+  Future<List<String>> _saveAllSectionsToServer(int inspectionId) async {
+    final failed = <String>[];
+    for (final section in _sections) {
+      if (!_sectionHasData(section)) continue;
+      final items = _buildSectionItems(section, httpOnly: true);
+      if (items.isEmpty) continue;
       try {
-        filePath = (json.decode(filePayload) as Map<String, dynamic>)['filePath'] as String?;
-      } catch (_) {
-        filePath = filePayload;
-      }
-    }
-
-    // Only push media that has finished uploading (http URLs). Local paths are
-    // never sent to the server — the offline media queue uploads them and
-    // replays save-step with the real URL once online. See [_commitPendingMediaToQueue].
-    final singleItem = {
-      'id': uniqueId,
-      'title': _getItemTitle(resolvedItem),
-      'value': value,
-      'remarks': (itemRemarks[uniqueId]?.isNotEmpty ?? false) ? itemRemarks[uniqueId] : null,
-      'imagePath': _httpOrNull(itemImages[uniqueId]),
-      'multiImages': _allHttpOrNull(itemMultiImages[uniqueId]),
-      'videoPath': _httpOrNull(itemVideos[uniqueId]),
-      'audioPath': _httpOrNull(itemAudios[uniqueId]),
-      'filePath': _httpOrNull(filePath),
-    };
-
-    final capturedSection = sectionName;
-    unawaited(Future(() async {
-      try {
-        final hasInternet = await ConnectivityChecker.canReachServer();
-        if (!hasInternet) return;
-        final result = await ApiService.saveInspectionStep(
+        final r = await ApiService.saveInspectionStep(
           inspectionId,
-          section: capturedSection,
-          items: [singleItem],
+          section: _sectionSlug(section),
+          items: items,
         );
-        // The result used to be discarded, so a rejected save-step (validation
-        // error, expired session, 5xx) left no trace at all — the answer looked
-        // saved and simply was not. Only exceptions were ever logged.
-        if (result['success'] == false) {
-          log('Per-field save rejected ($uniqueId): ${result['message']}');
+        if (r['success'] == false) {
+          failed.add(section['title']?.toString() ?? _sectionSlug(section));
+        } else {
+          _dirtySectionNames.remove(_sectionSlug(section));
         }
       } catch (e) {
-        log('Per-field save error ($uniqueId): $e');
+        log('Submit save-step error (${_sectionSlug(section)}): $e');
+        failed.add(section['title']?.toString() ?? _sectionSlug(section));
       }
-    }));
+    }
+    return failed;
+  }
+
+  /// Returns this inspection's server id, initializing a draft on demand when
+  /// none exists yet. Normally the id is already set (initialize runs when the
+  /// flow starts); this only fires for the rare submit-without-id case. Returns
+  /// null when offline or brand/model are unknown, so the caller can fall back
+  /// to the offline-save path. Caches the new id in [_sessionInspectionId].
+  Future<int?> _ensureServerInspectionId() async {
+    final existing = _effectiveInspectionId;
+    if (existing != null) return existing;
+
+    final vd = vehicleDetails;
+    int? asInt(dynamic v) => v is int ? v : int.tryParse(v?.toString() ?? '');
+    String? str(dynamic v) {
+      final s = v?.toString();
+      return (s == null || s.isEmpty) ? null : s;
+    }
+
+    final brandId = asInt(vd?['brand_id']);
+    final modelId = asInt(vd?['model_id']);
+    if (brandId == null || modelId == null) return null;
+    if (!await ConnectivityChecker.canReachServer()) return null;
+
+    try {
+      final result = await ApiService.initializeInspection(
+        vehicleBrandId: brandId,
+        vehicleModelId: modelId,
+        year: str(vd?['year']),
+        variant: str(vd?['variant']),
+        colour: str(vd?['color']),
+        transmission: str(vd?['transmission']),
+        regNo: str(vd?['regno']),
+      );
+      if (result['success'] == true) {
+        final id = asInt(result['inspection_id']);
+        if (id != null) {
+          _sessionInspectionId = id;
+          return id;
+        }
+      } else {
+        log('Ensure server id: initialize failed — ${result['message']}');
+      }
+    } catch (e) {
+      log('Ensure server id: initialize exception — $e');
+    }
+    return null;
   }
 
   void _autoSave() {
@@ -970,8 +1064,8 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
               .toString(),
       'make_model': [make, model].where((s) => s.isNotEmpty).join(' '),
       'variant': (v['variant'] ?? '').toString(),
-      'manufacturing_year': (v['year'] ?? v['manufacturing_year'] ?? '')
-          .toString(),
+      'manufacturing_year':
+          (v['year'] ?? v['manufacturing_year'] ?? '').toString(),
     };
   }
 
@@ -1391,6 +1485,9 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
           _currentSection = storedData.currentSection;
           itemMultiImages = storedData.typedMultiImages;
           itemFlaggedIssues = storedData.typedItemFlaggedIssues;
+          // Restore any server-saved answers / already-uploaded media URLs the
+          // local copy is missing, so resuming never drops uploaded data.
+          _mergeServerInitialData();
         });
         _initializeControllers();
       } else {
@@ -1592,8 +1689,7 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
           }
           final multi = item['initialMultiImages'];
           if (multi is List && multi.isNotEmpty) {
-            itemMultiImages[uniqueId] =
-                multi.map((e) => e.toString()).toList();
+            itemMultiImages[uniqueId] = multi.map((e) => e.toString()).toList();
           }
           final vid = item['initialVideo'];
           if (vid != null && vid.toString().isNotEmpty) {
@@ -1607,6 +1703,108 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
           if (fil != null && fil.toString().isNotEmpty) {
             itemFiles[uniqueId] = fil.toString();
           }
+        }
+      }
+    }
+  }
+
+  /// Overlays the server's `initial_*` data (previously-saved answers and
+  /// already-uploaded media URLs returned by /resume) onto the loaded local
+  /// maps, filling ONLY the fields the local working copy is missing.
+  ///
+  /// On resume the local Hive copy is the primary source, but it can lag the
+  /// server: media uploaded via the offline queue (or a save-step replayed on
+  /// another device) lives on the server yet may be absent from the working
+  /// copy that was last written. Without this merge that already-uploaded data
+  /// silently disappears from the inspection on resume. Local edits are never
+  /// overwritten — only empty/untouched fields are filled.
+  void _mergeServerInitialData() {
+    bool isBlank(String? v) => v == null || v.isEmpty;
+    // 'N/A' is the untouched default for option fields — treat it as empty so a
+    // previously-saved answer is restored.
+    void fillValue(String uniqueId, String? v) {
+      if (v == null || v.isEmpty) return;
+      final cur = itemValues[uniqueId];
+      if (cur == null || cur.isEmpty || cur == 'N/A') itemValues[uniqueId] = v;
+    }
+
+    final saved = _inspectionTemplate?.savedFields ?? const {};
+    for (final section in _sections) {
+      for (final item in section['items'] as List<dynamic>) {
+        if (item is! Map) continue;
+        final uniqueId = _getItemUniqueId(item);
+
+        // Source 1: per-field initial_* on the template structure.
+        fillValue(uniqueId, item['initialValue']?.toString());
+        final ir = item['initialRemarks'];
+        if (ir != null &&
+            ir.toString().isNotEmpty &&
+            isBlank(itemRemarks[uniqueId])) {
+          itemRemarks[uniqueId] = ir.toString();
+        }
+        final img = item['initialImage'];
+        if (img != null &&
+            img.toString().isNotEmpty &&
+            isBlank(itemImages[uniqueId])) {
+          itemImages[uniqueId] = img.toString();
+        }
+        final multi = item['initialMultiImages'];
+        if (multi is List &&
+            multi.isNotEmpty &&
+            (itemMultiImages[uniqueId]?.isEmpty ?? true)) {
+          itemMultiImages[uniqueId] = multi.map((e) => e.toString()).toList();
+        }
+        final vid = item['initialVideo'];
+        if (vid != null &&
+            vid.toString().isNotEmpty &&
+            isBlank(itemVideos[uniqueId])) {
+          itemVideos[uniqueId] = vid.toString();
+        }
+        final aud = item['initialAudio'];
+        if (aud != null &&
+            aud.toString().isNotEmpty &&
+            isBlank(itemAudios[uniqueId])) {
+          itemAudios[uniqueId] = aud.toString();
+        }
+        final fil = item['initialFile'];
+        if (fil != null &&
+            fil.toString().isNotEmpty &&
+            isBlank(itemFiles[uniqueId])) {
+          itemFiles[uniqueId] = fil.toString();
+        }
+
+        // Source 2: the server's saved_sections payload, keyed by item id (the
+        // value we send in save-step) with a fieldId fallback. Same
+        // fill-only-when-empty rule, so it never overwrites the above or a
+        // local edit — it only recovers data the template's initial_* omitted.
+        final sv = saved[uniqueId] ?? saved[_getItemFieldId(item)];
+        if (sv == null) continue;
+        fillValue(uniqueId, sv['value'] as String?);
+        final sr = sv['remarks'] as String?;
+        if (sr != null && sr.isNotEmpty && isBlank(itemRemarks[uniqueId])) {
+          itemRemarks[uniqueId] = sr;
+        }
+        final sImg = sv['image'] as String?;
+        if (sImg != null && sImg.isNotEmpty && isBlank(itemImages[uniqueId])) {
+          itemImages[uniqueId] = sImg;
+        }
+        final sMulti = sv['multiImages'];
+        if (sMulti is List &&
+            sMulti.isNotEmpty &&
+            (itemMultiImages[uniqueId]?.isEmpty ?? true)) {
+          itemMultiImages[uniqueId] = sMulti.map((e) => e.toString()).toList();
+        }
+        final sVid = sv['video'] as String?;
+        if (sVid != null && sVid.isNotEmpty && isBlank(itemVideos[uniqueId])) {
+          itemVideos[uniqueId] = sVid;
+        }
+        final sAud = sv['audio'] as String?;
+        if (sAud != null && sAud.isNotEmpty && isBlank(itemAudios[uniqueId])) {
+          itemAudios[uniqueId] = sAud;
+        }
+        final sFil = sv['file'] as String?;
+        if (sFil != null && sFil.isNotEmpty && isBlank(itemFiles[uniqueId])) {
+          itemFiles[uniqueId] = sFil;
         }
       }
     }
@@ -2077,12 +2275,10 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
             Container(
               width: double.infinity,
               color: const Color(0xFFFEE2E2),
-              padding:
-                  const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
               child: const Row(
                 children: [
-                  Icon(Icons.error_outline,
-                      size: 16, color: Color(0xFFDC2626)),
+                  Icon(Icons.error_outline, size: 16, color: Color(0xFFDC2626)),
                   SizedBox(width: 6),
                   Expanded(
                     child: Text(
@@ -2225,7 +2421,8 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
                               minWidth: 36,
                               minHeight: 36,
                             ),
-                            onPressed: () => _showFlagIssuesSheet(item, autoAdvanceOnConfirm: true),
+                            onPressed: () => _showFlagIssuesSheet(item,
+                                autoAdvanceOnConfirm: true),
                           ),
                       ],
                     ),
@@ -2235,7 +2432,7 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
                 if (referenceMedia.isNotEmpty) ...[
                   ReferenceMediaSectionView(
                     mediaList: referenceMedia,
-                    imageHeight: 110,
+                    imageHeight: 280,
                     maxItems: 1,
                     trailing: InspectionInfoButton(
                       fieldId: uniqueId,
@@ -2271,7 +2468,8 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
                   itemImages[uniqueId] = savedPath;
                   _markUploading(uniqueId);
                 });
-                if (mounted) _showFlagIssuesSheet(item, autoAdvanceOnConfirm: true);
+                if (mounted)
+                  _showFlagIssuesSheet(item, autoAdvanceOnConfirm: true);
                 await _saveDataLocally();
                 final bool hasInternet =
                     await ConnectivityChecker.canReachServer();
@@ -2287,10 +2485,14 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
                   if (mounted) {
                     _unmarkUploading(uniqueId);
                     final url = result['url']?.toString();
-                    if (result['success'] == true && url != null && url.isNotEmpty) {
+                    if (result['success'] == true &&
+                        url != null &&
+                        url.isNotEmpty) {
                       setState(() => itemImages[uniqueId] = url);
                       await _saveDataLocally();
-                      try { await File(savedPath).delete(); } catch (_) {}
+                      try {
+                        await File(savedPath).delete();
+                      } catch (_) {}
                       _saveFieldToServer(item, uniqueId);
                     } else {
                       _showUploadFailedSnack(result);
@@ -2305,7 +2507,6 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
             ),
             const SizedBox(height: 8),
           ],
-
 
           // ── Full-width video card ───────────────────────────────
           if (_itemHasVideo(item) && itemVideos[uniqueId] == null) ...[
@@ -2605,38 +2806,33 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
               contentPadding:
                   const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
             ),
-            items: ((item['options'] as List?) ?? [])
-                .map((opt) {
-                  final colorCodeStr = (opt['colorCode'] ?? '').toString();
-                  Color? optionColor;
-                  if (colorCodeStr.startsWith('#') &&
-                      colorCodeStr.length >= 7) {
-                    final hex = colorCodeStr.replaceFirst('#', '');
-                    optionColor =
-                        Color(int.parse('FF$hex', radix: 16));
-                  }
-                  return DropdownMenuItem<String>(
-                    value: (opt['value'] ?? '').toString(),
-                    child: Row(
-                      children: [
-                        if (optionColor != null) ...[
-                          Container(
-                            width: 12,
-                            height: 12,
-                            decoration: BoxDecoration(
-                              color: optionColor,
-                              shape: BoxShape.circle,
-                            ),
-                          ),
-                          const SizedBox(width: 8),
-                        ],
-                        Text(
-                            (opt['label'] ?? opt['value'] ?? '').toString()),
-                      ],
-                    ),
-                  );
-                })
-                .toList(),
+            items: ((item['options'] as List?) ?? []).map((opt) {
+              final colorCodeStr = (opt['colorCode'] ?? '').toString();
+              Color? optionColor;
+              if (colorCodeStr.startsWith('#') && colorCodeStr.length >= 7) {
+                final hex = colorCodeStr.replaceFirst('#', '');
+                optionColor = Color(int.parse('FF$hex', radix: 16));
+              }
+              return DropdownMenuItem<String>(
+                value: (opt['value'] ?? '').toString(),
+                child: Row(
+                  children: [
+                    if (optionColor != null) ...[
+                      Container(
+                        width: 12,
+                        height: 12,
+                        decoration: BoxDecoration(
+                          color: optionColor,
+                          shape: BoxShape.circle,
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                    ],
+                    Text((opt['label'] ?? opt['value'] ?? '').toString()),
+                  ],
+                ),
+              );
+            }).toList(),
             onChanged: (value) {
               if (value == null) return;
               setState(() {
@@ -2700,7 +2896,8 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
                 title: const Text('Choose from Gallery'),
                 onTap: () {
                   Navigator.pop(context);
-                  _pickImage(ImageSource.gallery, uniqueId, fieldId, item: item);
+                  _pickImage(ImageSource.gallery, uniqueId, fieldId,
+                      item: item);
                 },
               ),
             ],
@@ -2759,11 +2956,14 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
               separatorBuilder: (_, __) => const SizedBox(width: 8),
               itemBuilder: (context, index) {
                 final imagePath = images[index];
-                final isUploading = _uploadingMultiImagePaths.contains(imagePath);
+                final isUploading =
+                    _uploadingMultiImagePaths.contains(imagePath);
                 return Stack(
                   children: [
                     GestureDetector(
-                      onTap: isUploading ? null : () => _showImagePreview(imagePath),
+                      onTap: isUploading
+                          ? null
+                          : () => _showImagePreview(imagePath),
                       child: Container(
                         width: 70,
                         height: 70,
@@ -2866,7 +3066,8 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
       if (toAdd.length < picked.length && mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: Text('Only ${toAdd.length} image(s) added. Maximum is $maxImages.'),
+            content: Text(
+                'Only ${toAdd.length} image(s) added. Maximum is $maxImages.'),
             backgroundColor: Colors.orange,
           ),
         );
@@ -2895,7 +3096,8 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
           setState(() => _uploadingMultiImagePaths.removeAll(savedPaths));
           ScaffoldMessenger.of(context).showSnackBar(
             const SnackBar(
-                content: Text('Images saved locally. Will upload when online.')),
+                content:
+                    Text('Images saved locally. Will upload when online.')),
           );
         }
         // Offline: persist to the durable upload queue right away so the photos
@@ -2914,7 +3116,8 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
         if (!mounted) return;
 
         final url = result['url']?.toString();
-        final uploadSuccess = result['success'] == true && url != null && url.isNotEmpty;
+        final uploadSuccess =
+            result['success'] == true && url != null && url.isNotEmpty;
         setState(() {
           _uploadingMultiImagePaths.remove(savedPath);
           if (uploadSuccess) {
@@ -2925,7 +3128,9 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
           }
         });
         if (uploadSuccess) {
-          try { await File(savedPath).delete(); } catch (_) {}
+          try {
+            await File(savedPath).delete();
+          } catch (_) {}
         }
       }
       await _saveDataLocally();
@@ -2986,8 +3191,7 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
     );
   }
 
-  Future<void> _pickImage(
-      ImageSource source, String uniqueId, String fieldId,
+  Future<void> _pickImage(ImageSource source, String uniqueId, String fieldId,
       {dynamic item}) async {
     try {
       final hasPermission = source == ImageSource.camera
@@ -3016,12 +3220,12 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
           itemImages[uniqueId] = savedPath;
           _markUploading(uniqueId);
         });
-        if (item != null && mounted) _showFlagIssuesSheet(item, autoAdvanceOnConfirm: true);
+        if (item != null && mounted)
+          _showFlagIssuesSheet(item, autoAdvanceOnConfirm: true);
 
         await _saveDataLocally();
 
-        final bool hasInternet =
-            await ConnectivityChecker.canReachServer();
+        final bool hasInternet = await ConnectivityChecker.canReachServer();
 
         if (hasInternet) {
           final result = await ApiService.uploadImage(
@@ -3044,7 +3248,9 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
                 itemImages[uniqueId] = url;
               });
               await _saveDataLocally();
-              try { await File(savedPath).delete(); } catch (_) {}
+              try {
+                await File(savedPath).delete();
+              } catch (_) {}
               _saveFieldToServer(item, uniqueId);
             } else {
               // Was "will upload when online" for every failure, which is a
@@ -3129,7 +3335,8 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
             const SnackBar(
-              content: Text('Microphone permission is required to record audio'),
+              content:
+                  Text('Microphone permission is required to record audio'),
             ),
           );
         }
@@ -3561,7 +3768,8 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
         as List<dynamic>)[_currentItemIndex];
     final fieldId = _getItemFieldId(item);
     final sectionTitle = _sections[_currentSection]['title'] as String;
-    final savedPath = await LocalStorageService.saveImage(file.path, rotateAngle: quarterTurns * 90);
+    final savedPath = await LocalStorageService.saveImage(file.path,
+        rotateAngle: quarterTurns * 90);
     unawaited(LocalStorageService.saveMediaToUserStorage(
       savedPath,
       MediaType.image,
@@ -3590,7 +3798,9 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
         if (result['success'] == true && url != null && url.isNotEmpty) {
           setState(() => itemImages[uniqueId] = url);
           await _saveDataLocally();
-          try { await File(savedPath).delete(); } catch (_) {}
+          try {
+            await File(savedPath).delete();
+          } catch (_) {}
           _saveFieldToServer(item, uniqueId);
         } else {
           _showUploadFailedSnack(result);
@@ -3641,7 +3851,8 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
       itemVideoRotations[uniqueId] = quarterTurns;
       _markUploading(uniqueId);
     });
-    if (foundItem != null && mounted) _showFlagIssuesSheet(foundItem, autoAdvanceOnConfirm: true);
+    if (foundItem != null && mounted)
+      _showFlagIssuesSheet(foundItem, autoAdvanceOnConfirm: true);
 
     await _saveDataLocally();
 
@@ -3721,7 +3932,8 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
       itemAudios[uniqueId] = path;
       _markUploading(uniqueId);
     });
-    if (foundItem != null && mounted) _showFlagIssuesSheet(foundItem, autoAdvanceOnConfirm: true);
+    if (foundItem != null && mounted)
+      _showFlagIssuesSheet(foundItem, autoAdvanceOnConfirm: true);
 
     await _saveDataLocally();
 
@@ -3741,7 +3953,9 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
         if (result['success'] == true && url != null && url.isNotEmpty) {
           setState(() => itemAudios[uniqueId] = url);
           await _saveDataLocally();
-          try { await File(path).delete(); } catch (_) {}
+          try {
+            await File(path).delete();
+          } catch (_) {}
           _saveFieldToServer(foundItem, uniqueId);
         } else {
           _showUploadFailedSnack(result);
@@ -3798,7 +4012,8 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
       itemFiles[uniqueId] = payload;
       _markUploading(uniqueId);
     });
-    if (foundItem != null && mounted) _showFlagIssuesSheet(foundItem, autoAdvanceOnConfirm: true);
+    if (foundItem != null && mounted)
+      _showFlagIssuesSheet(foundItem, autoAdvanceOnConfirm: true);
 
     await _saveDataLocally();
 
@@ -3822,7 +4037,9 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
                 'fileType': ext ?? '',
               }));
           await _saveDataLocally();
-          try { await File(path).delete(); } catch (_) {}
+          try {
+            await File(path).delete();
+          } catch (_) {}
           _saveFieldToServer(foundItem, uniqueId);
         } else {
           _showUploadFailedSnack(result);
@@ -3913,7 +4130,8 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
       ScaffoldMessenger.of(context).clearSnackBars();
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: Text('"$title" is required and must be filled before proceeding'),
+          content:
+              Text('"$title" is required and must be filled before proceeding'),
           backgroundColor: Colors.red.shade700,
           duration: const Duration(seconds: 3),
         ),
@@ -4036,6 +4254,9 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
     }
     if (_currentSection <= 0) return;
 
+    // Crossing back into the previous section — flush this one's edits first.
+    _flushDirtySectionsToServer();
+
     final prevItems = _sections[_currentSection - 1]['items'] as List<dynamic>;
     final lastIdx = prevItems.isEmpty ? 0 : prevItems.length - 1;
     final lastItem = prevItems.isNotEmpty ? prevItems[lastIdx] : null;
@@ -4149,6 +4370,9 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
         (itemIndex >= 0 && itemIndex < items.length) ? itemIndex : 0;
     final targetItem = items.isNotEmpty ? items[safeItemIndex] : null;
 
+    // Jumping to another section — flush any pending edits from the current one.
+    if (sectionIndex != _currentSection) _flushDirtySectionsToServer();
+
     _audioTimer?.cancel();
     _audioTimer = null;
     _audioRecorder?.stop().then((_) {
@@ -4159,9 +4383,8 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
     setState(() {
       _currentSection = sectionIndex;
       _currentItemIndex = safeItemIndex;
-      _currentCaptureMode = targetItem != null
-          ? _defaultCaptureModeForItem(targetItem)
-          : 'PHOTO';
+      _currentCaptureMode =
+          targetItem != null ? _defaultCaptureModeForItem(targetItem) : 'PHOTO';
       _triggerPhotoCapture = null;
       _triggerEnlarge = null;
       _triggerFlashToggle = null;
@@ -4202,8 +4425,7 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
             })>
         groups,
   ) {
-    final totalMissing =
-        groups.fold<int>(0, (sum, g) => sum + g.fields.length);
+    final totalMissing = groups.fold<int>(0, (sum, g) => sum + g.fields.length);
     log('Submission blocked - $totalMissing required field(s) missing across ${groups.length} section(s)');
 
     showModalBottomSheet(
@@ -4287,8 +4509,7 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
                         children: [
                           if (group.sectionTitle.isNotEmpty)
                             Padding(
-                              padding:
-                                  const EdgeInsets.fromLTRB(20, 12, 20, 4),
+                              padding: const EdgeInsets.fromLTRB(20, 12, 20, 4),
                               child: Text(
                                 group.sectionTitle.toUpperCase(),
                                 style: const TextStyle(
@@ -4821,6 +5042,8 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
     }
 
     if (_currentSection < _sections.length - 1) {
+      // Leaving this section — push its accumulated edits as one save-step.
+      _flushDirtySectionsToServer();
       _audioTimer?.cancel();
       _audioTimer = null;
       _audioRecorder?.stop().then((_) {
@@ -5306,17 +5529,42 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
           }
           return;
         }
-        // Process 2: build the body with httpOnly so only uploaded URLs are sent.
-        final body = _buildSubmissionBody(httpOnly: true);
-        // Finalise the existing server draft by id (POST /{id}/submit) so we
-        // never create a duplicate. Only fall back to the legacy all-at-once
-        // create when there is genuinely no server id yet.
-        final serverId = _effectiveInspectionId;
-        final result = serverId != null
-            ? await ApiService.submitInspectionById(serverId, body)
-            : await ApiService.submitInspection(body);
-        log(body.toString());
-        log(result.toString());
+        // Process 2: make sure the draft exists server-side. It is normally
+        // created by initialize at the start of the flow; only mint one here for
+        // the rare case where submit is reached without an id (e.g. started
+        // offline, now online) — the all-at-once create endpoint is gone.
+        final serverId =
+            _effectiveInspectionId ?? await _ensureServerInspectionId();
+
+        Map<String, dynamic> result;
+        if (serverId == null) {
+          // No id and couldn't create one — fail through to the offline-save
+          // fallback below so nothing is lost; the queue drain finalises later.
+          result = {
+            'success': false,
+            'message': 'Could not reach the server to start the inspection.',
+          };
+        } else {
+          // Process 3: save-step every populated section so the server holds the
+          // complete inspection, then finalise with an EMPTY body. The data is
+          // already there via save-step, so we never re-POST the whole JSON.
+          final failedSections = await _saveAllSectionsToServer(serverId);
+          if (failedSections.isNotEmpty) {
+            if (mounted) {
+              setState(() => _isSubmitting = false);
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(
+                  content: Text(
+                      'Could not save ${failedSections.join(", ")}. Check your connection and try again.'),
+                  backgroundColor: Colors.red.shade700,
+                ),
+              );
+            }
+            return;
+          }
+          result = await ApiService.submitInspectionById(serverId, const {});
+          log(result.toString());
+        }
 
         if (result['success'] == true) {
           final sid = _effectiveInspectionId;
@@ -5756,7 +6004,8 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
                 setState(() => _triggerVideoToggle = fn),
             onPauseResumeReady: (fn) =>
                 setState(() => _triggerVideoPauseResume = fn),
-            onFlashToggleReady: (fn) => setState(() => _triggerFlashToggle = fn),
+            onFlashToggleReady: (fn) =>
+                setState(() => _triggerFlashToggle = fn),
             onRecordingChanged: (recording) {
               // Notifier-only: rebuilds just the overlay via ListenableBuilder.
               _captureUi.isVideoRecording.value = recording;
@@ -5930,632 +6179,651 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
     return ListenableBuilder(
       listenable: _captureUi.listenable,
       builder: (context, _) => Column(
-      children: [
-        // ── Capture area ──────────────────────────────────────────
-        Expanded(
-          child: Stack(
-            fit: StackFit.expand,
-            children: [
-              captureArea,
+        children: [
+          // ── Capture area ──────────────────────────────────────────
+          Expanded(
+            child: Stack(
+              fit: StackFit.expand,
+              children: [
+                captureArea,
 
-              // Reference thumbnail (PHOTO / VIDEO only, top-left)
-              if (refUrl.isNotEmpty &&
-                  _currentCaptureMode != 'FILE' &&
-                  _currentCaptureMode != 'AUDIO')
-                Positioned(
-                  top: 12,
-                  left: 12,
-                  child: GestureDetector(
-                    onTap: () =>
-                        _showFullscreenReferenceImage(referenceMedia, 0),
-                    child: Container(
-                      width: 100,
-                      height: 75,
-                      decoration: BoxDecoration(
-                        borderRadius: BorderRadius.circular(8),
-                        border: Border.all(
-                          color: const Color(0xFFFF6B6B).withValues(alpha: 0.8),
-                          width: 2,
+                // Reference thumbnail (PHOTO / VIDEO only, top-left)
+                if (refUrl.isNotEmpty &&
+                    _currentCaptureMode != 'FILE' &&
+                    _currentCaptureMode != 'AUDIO')
+                  Positioned(
+                    top: 12,
+                    left: 12,
+                    child: GestureDetector(
+                      onTap: () =>
+                          _showFullscreenReferenceImage(referenceMedia, 0),
+                      child: Container(
+                        width: 100,
+                        height: 75,
+                        decoration: BoxDecoration(
+                          borderRadius: BorderRadius.circular(8),
+                          border: Border.all(
+                            color:
+                                const Color(0xFFFF6B6B).withValues(alpha: 0.8),
+                            width: 2,
+                          ),
                         ),
-                      ),
-                      child: ClipRRect(
-                        borderRadius: BorderRadius.circular(6),
-                        child: Stack(
-                          fit: StackFit.expand,
-                          children: [
-                            if (refMediaType == 'video')
-                              Container(
-                                color: Colors.black87,
-                                child: const Center(
-                                  child: Icon(
-                                    Icons.play_circle_filled,
-                                    color: Colors.white70,
-                                    size: 32,
-                                  ),
-                                ),
-                              )
-                            else
-                              // Cache-aware so the guide thumbnail still shows
-                              // from disk when the inspector is offline (plain
-                              // Image.network would fail and leave it blank).
-                              CachedReferenceImage(
-                                url: refUrl,
-                                fit: BoxFit.cover,
-                                // 100×75 dp container; 2× for retina.
-                                cacheWidth: 200,
-                                cacheHeight: 150,
-                              ),
-                            Positioned(
-                              bottom: 2,
-                              left: 0,
-                              right: 0,
-                              child: Container(
-                                color: Colors.black54,
-                                padding:
-                                    const EdgeInsets.symmetric(vertical: 2),
-                                child: const Text(
-                                  'REF',
-                                  textAlign: TextAlign.center,
-                                  style: TextStyle(
-                                    color: Colors.white,
-                                    fontSize: 8,
-                                    fontWeight: FontWeight.w700,
-                                    letterSpacing: 0.5,
-                                  ),
-                                ),
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-                    ),
-                  ),
-                ),
-
-              // Recording indicator (VIDEO recording, top-right)
-              if (_currentCaptureMode == 'VIDEO' && _captureUi.isVideoRecording.value)
-                Positioned(
-                  top: 12,
-                  right: 12,
-                  child: Container(
-                    padding:
-                        const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
-                    decoration: BoxDecoration(
-                      color: Colors.black54,
-                      borderRadius: BorderRadius.circular(20),
-                    ),
-                    child: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Icon(
-                          _captureUi.isVideoPaused.value ? Icons.pause : Icons.circle,
-                          color: _captureUi.isVideoPaused.value ? Colors.amber : Colors.red,
-                          size: 8,
-                        ),
-                        const SizedBox(width: 5),
-                        Text(_captureUi.isVideoPaused.value ? 'PAUSED' : 'REC',
-                            style: const TextStyle(
-                                color: Colors.white,
-                                fontSize: 12,
-                                fontWeight: FontWeight.w700)),
-                      ],
-                    ),
-                  ),
-                ),
-
-              // Enlarge button (PHOTO, camera active, top-right)
-              if (!hasCapturedPhoto && _currentCaptureMode == 'PHOTO')
-                Positioned(
-                  top: 12,
-                  right: 12,
-                  child: GestureDetector(
-                    onTap: _triggerEnlarge,
-                    child: Container(
-                      width: 36,
-                      height: 36,
-                      decoration: BoxDecoration(
-                        color: Colors.black.withValues(alpha: 0.45),
-                        shape: BoxShape.circle,
-                        border: Border.all(color: Colors.white24),
-                      ),
-                      child: Icon(
-                        Icons.open_in_full,
-                        color: _triggerEnlarge != null
-                            ? Colors.white70
-                            : Colors.white24,
-                        size: 18,
-                      ),
-                    ),
-                  ),
-                ),
-
-              // Retake badge (PHOTO captured, top-right)
-              if (hasCapturedPhoto && _currentCaptureMode == 'PHOTO')
-                Positioned(
-                  top: 12,
-                  right: 12,
-                  child: GestureDetector(
-                    onTap: () => _showImagePickerOptions(item),
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(
-                          horizontal: 12, vertical: 6),
-                      decoration: BoxDecoration(
-                        color: Colors.black54,
-                        borderRadius: BorderRadius.circular(20),
-                        border: Border.all(color: Colors.white30),
-                      ),
-                      child: ValueListenableBuilder<Set<String>>(
-                        valueListenable: _uploadingImages,
-                        builder: (context, uploading, _) {
-                          final uploadingNow = uploading.contains(uniqueId);
-                          return Row(
-                            mainAxisSize: MainAxisSize.min,
+                        child: ClipRRect(
+                          borderRadius: BorderRadius.circular(6),
+                          child: Stack(
+                            fit: StackFit.expand,
                             children: [
-                              if (uploadingNow) ...[
-                                const SizedBox(
-                                  width: 12,
-                                  height: 12,
-                                  child: CircularProgressIndicator(
-                                      strokeWidth: 2, color: Colors.white),
+                              if (refMediaType == 'video')
+                                Container(
+                                  color: Colors.black87,
+                                  child: const Center(
+                                    child: Icon(
+                                      Icons.play_circle_filled,
+                                      color: Colors.white70,
+                                      size: 32,
+                                    ),
+                                  ),
+                                )
+                              else
+                                // Cache-aware so the guide thumbnail still shows
+                                // from disk when the inspector is offline (plain
+                                // Image.network would fail and leave it blank).
+                                CachedReferenceImage(
+                                  url: refUrl,
+                                  fit: BoxFit.cover,
+                                  // 100×75 dp container; 2× for retina.
+                                  cacheWidth: 200,
+                                  cacheHeight: 150,
                                 ),
-                                const SizedBox(width: 6),
-                                ValueListenableBuilder<
-                                    Map<String, MediaFileProgress>>(
-                                  valueListenable: _uploadProgress,
-                                  builder: (context, progress, _) => Text(
-                                    // No rate here: the chip sits over the
-                                    // camera preview and has no room for it.
-                                    uploadBadgeLabel(progress[uniqueId],
-                                        withRate: false),
-                                    style: const TextStyle(
-                                        color: Colors.white, fontSize: 12),
+                              Positioned(
+                                bottom: 2,
+                                left: 0,
+                                right: 0,
+                                child: Container(
+                                  color: Colors.black54,
+                                  padding:
+                                      const EdgeInsets.symmetric(vertical: 2),
+                                  child: const Text(
+                                    'REF',
+                                    textAlign: TextAlign.center,
+                                    style: TextStyle(
+                                      color: Colors.white,
+                                      fontSize: 8,
+                                      fontWeight: FontWeight.w700,
+                                      letterSpacing: 0.5,
+                                    ),
                                   ),
                                 ),
-                              ] else ...[
-                                const Icon(Icons.refresh,
-                                    color: Colors.white, size: 14),
-                                const SizedBox(width: 4),
-                                const Text('Retake',
-                                    style: TextStyle(
-                                        color: Colors.white,
-                                        fontSize: 12,
-                                        fontWeight: FontWeight.w600)),
-                              ],
+                              ),
                             ],
-                          );
-                        },
+                          ),
+                        ),
                       ),
                     ),
                   ),
-                ),
 
-              // Replace badge (FILE attached, top-right)
-              if (hasAttachedFile && _currentCaptureMode == 'FILE')
-                Positioned(
-                  top: 12,
-                  right: 12,
-                  child: GestureDetector(
-                    onTap: () => _showFilePickerOptions(item),
+                // Recording indicator (VIDEO recording, top-right)
+                if (_currentCaptureMode == 'VIDEO' &&
+                    _captureUi.isVideoRecording.value)
+                  Positioned(
+                    top: 12,
+                    right: 12,
                     child: Container(
                       padding: const EdgeInsets.symmetric(
-                          horizontal: 12, vertical: 6),
+                          horizontal: 10, vertical: 5),
                       decoration: BoxDecoration(
                         color: Colors.black54,
                         borderRadius: BorderRadius.circular(20),
-                        border: Border.all(color: Colors.white30),
                       ),
-                      child: const Row(
+                      child: Row(
                         mainAxisSize: MainAxisSize.min,
                         children: [
-                          Icon(Icons.swap_horiz, color: Colors.white, size: 14),
-                          SizedBox(width: 4),
-                          Text('Replace',
-                              style: TextStyle(
+                          Icon(
+                            _captureUi.isVideoPaused.value
+                                ? Icons.pause
+                                : Icons.circle,
+                            color: _captureUi.isVideoPaused.value
+                                ? Colors.amber
+                                : Colors.red,
+                            size: 8,
+                          ),
+                          const SizedBox(width: 5),
+                          Text(
+                              _captureUi.isVideoPaused.value ? 'PAUSED' : 'REC',
+                              style: const TextStyle(
                                   color: Colors.white,
                                   fontSize: 12,
-                                  fontWeight: FontWeight.w600)),
+                                  fontWeight: FontWeight.w700)),
                         ],
                       ),
                     ),
                   ),
-                ),
 
-              // Condition chip overlay (bottom of capture area)
-              Positioned(
-                bottom: 10,
-                left: 12,
-                right: 12,
-                child: Row(
-                  children: [
-                    Expanded(
-                      child: GestureDetector(
-                        onTap: () => _showFlagIssuesSheet(item, autoAdvanceOnConfirm: true),
-                        child: Container(
-                          padding: const EdgeInsets.symmetric(
-                              horizontal: 10, vertical: 6),
-                          decoration: BoxDecoration(
-                            color: Colors.black54,
-                            borderRadius: BorderRadius.circular(20),
-                            border: Border.all(
-                                color: condColor.withValues(alpha: 0.6)),
-                          ),
-                          child: Row(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              Icon(condIcon, size: 13, color: condColor),
-                              const SizedBox(width: 6),
-                              Flexible(
-                                child: Text(
-                                  condLabel,
-                                  style: TextStyle(
-                                    color: condColor,
-                                    fontSize: 12,
-                                    fontWeight: FontWeight.w500,
-                                  ),
-                                  overflow: TextOverflow.ellipsis,
-                                ),
-                              ),
-                            ],
-                          ),
+                // Enlarge button (PHOTO, camera active, top-right)
+                if (!hasCapturedPhoto && _currentCaptureMode == 'PHOTO')
+                  Positioned(
+                    top: 12,
+                    right: 12,
+                    child: GestureDetector(
+                      onTap: _triggerEnlarge,
+                      child: Container(
+                        width: 36,
+                        height: 36,
+                        decoration: BoxDecoration(
+                          color: Colors.black.withValues(alpha: 0.45),
+                          shape: BoxShape.circle,
+                          border: Border.all(color: Colors.white24),
+                        ),
+                        child: Icon(
+                          Icons.open_in_full,
+                          color: _triggerEnlarge != null
+                              ? Colors.white70
+                              : Colors.white24,
+                          size: 18,
                         ),
                       ),
                     ),
-                    const SizedBox(width: 8),
-                    GestureDetector(
-                      onTap: () {
-                        _highlightFlagIssues.value = false;
-                        _showFlagIssuesSheet(item, autoAdvanceOnConfirm: true);
-                      },
-                      child: ValueListenableBuilder<bool>(
-                        valueListenable: _highlightFlagIssues,
-                        builder: (context, highlight, _) => Container(
-                          padding: const EdgeInsets.symmetric(
-                              horizontal: 10, vertical: 6),
-                          decoration: BoxDecoration(
-                            color: highlight
-                                ? Colors.orange.withValues(alpha: 0.2)
-                                : Colors.black54,
-                            borderRadius: BorderRadius.circular(20),
-                            border: Border.all(
-                                color: highlight
-                                    ? Colors.orange
-                                    : Colors.white24),
-                          ),
-                          child: Row(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              Icon(Icons.flag_outlined,
-                                  size: 13,
-                                  color: highlight
-                                      ? Colors.orange
-                                      : Colors.white70),
-                              const SizedBox(width: 4),
-                              Text('Flag Issue',
-                                  style: TextStyle(
-                                      color: highlight
-                                          ? Colors.orange
-                                          : Colors.white70,
-                                      fontSize: 12,
-                                      fontWeight: FontWeight.w500)),
-                            ],
-                          ),
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ],
-          ),
-        ),
-
-        // ── Bottom control panel ───────────────────────────────────
-        Container(
-          color: const Color(0xFF0D0D0D),
-          padding: const EdgeInsets.fromLTRB(16, 10, 16, 0),
-          child: SafeArea(
-            top: false,
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                // Instruction text
-                Text(
-                  _currentCaptureMode == 'VIDEO'
-                      ? 'Record a video of: $title'
-                      : _currentCaptureMode == 'FILE'
-                          ? 'Attach a document for: $title'
-                          : _currentCaptureMode == 'AUDIO'
-                              ? 'Add an audio note for: $title'
-                              : 'Take a clear photo of: $title',
-                  style: const TextStyle(
-                    color: Colors.white,
-                    fontSize: 13,
-                    fontWeight: FontWeight.w500,
                   ),
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                ),
-                const SizedBox(height: 8),
 
-                // Mode tabs — text + underline only
-                Row(
-                  children: ['FILE', 'PHOTO', 'VIDEO', 'AUDIO'].map((mode) {
-                    final isSelected = mode == _currentCaptureMode;
-                    return Expanded(
-                      child: GestureDetector(
-                        onTap: () {
-                          if (!isSelected) {
-                            _audioTimer?.cancel();
-                            _audioTimer = null;
-                            _audioRecorder?.stop().then((_) {
-                              _audioRecorder?.dispose();
-                              _audioRecorder = null;
-                            });
-                            setState(() {
-                              _currentCaptureMode = mode;
-                              _triggerPhotoCapture = null;
-                              _triggerEnlarge = null;
-                              _triggerFlashToggle = null;
-                              _captureUi.flashOn.value = false;
-                              _triggerVideoToggle = null;
-                              _triggerVideoPauseResume = null;
-                              _captureUi.isVideoRecording.value = false;
-                              _captureUi.isVideoPaused.value = false;
-                              _isRecordingAudio = false;
-                              _audioElapsed.value = Duration.zero;
-                            });
-                          }
-                        },
-                        child: Column(
+                // Retake badge (PHOTO captured, top-right)
+                if (hasCapturedPhoto && _currentCaptureMode == 'PHOTO')
+                  Positioned(
+                    top: 12,
+                    right: 12,
+                    child: GestureDetector(
+                      onTap: () => _showImagePickerOptions(item),
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 12, vertical: 6),
+                        decoration: BoxDecoration(
+                          color: Colors.black54,
+                          borderRadius: BorderRadius.circular(20),
+                          border: Border.all(color: Colors.white30),
+                        ),
+                        child: ValueListenableBuilder<Set<String>>(
+                          valueListenable: _uploadingImages,
+                          builder: (context, uploading, _) {
+                            final uploadingNow = uploading.contains(uniqueId);
+                            return Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                if (uploadingNow) ...[
+                                  const SizedBox(
+                                    width: 12,
+                                    height: 12,
+                                    child: CircularProgressIndicator(
+                                        strokeWidth: 2, color: Colors.white),
+                                  ),
+                                  const SizedBox(width: 6),
+                                  ValueListenableBuilder<
+                                      Map<String, MediaFileProgress>>(
+                                    valueListenable: _uploadProgress,
+                                    builder: (context, progress, _) => Text(
+                                      // No rate here: the chip sits over the
+                                      // camera preview and has no room for it.
+                                      uploadBadgeLabel(progress[uniqueId],
+                                          withRate: false),
+                                      style: const TextStyle(
+                                          color: Colors.white, fontSize: 12),
+                                    ),
+                                  ),
+                                ] else ...[
+                                  const Icon(Icons.refresh,
+                                      color: Colors.white, size: 14),
+                                  const SizedBox(width: 4),
+                                  const Text('Retake',
+                                      style: TextStyle(
+                                          color: Colors.white,
+                                          fontSize: 12,
+                                          fontWeight: FontWeight.w600)),
+                                ],
+                              ],
+                            );
+                          },
+                        ),
+                      ),
+                    ),
+                  ),
+
+                // Replace badge (FILE attached, top-right)
+                if (hasAttachedFile && _currentCaptureMode == 'FILE')
+                  Positioned(
+                    top: 12,
+                    right: 12,
+                    child: GestureDetector(
+                      onTap: () => _showFilePickerOptions(item),
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 12, vertical: 6),
+                        decoration: BoxDecoration(
+                          color: Colors.black54,
+                          borderRadius: BorderRadius.circular(20),
+                          border: Border.all(color: Colors.white30),
+                        ),
+                        child: const Row(
                           mainAxisSize: MainAxisSize.min,
                           children: [
-                            Text(
-                              mode,
-                              textAlign: TextAlign.center,
-                              style: TextStyle(
-                                color:
-                                    isSelected ? Colors.white : Colors.white38,
-                                fontSize: 11,
-                                fontWeight: isSelected
-                                    ? FontWeight.w700
-                                    : FontWeight.w400,
-                              ),
-                            ),
-                            const SizedBox(height: 4),
-                            AnimatedContainer(
-                              duration: const Duration(milliseconds: 200),
-                              height: 2,
-                              decoration: BoxDecoration(
-                                color: isSelected
-                                    ? const Color(0xFF4D9EFF)
-                                    : Colors.transparent,
-                                borderRadius: BorderRadius.circular(1),
-                              ),
-                            ),
+                            Icon(Icons.swap_horiz,
+                                color: Colors.white, size: 14),
+                            SizedBox(width: 4),
+                            Text('Replace',
+                                style: TextStyle(
+                                    color: Colors.white,
+                                    fontSize: 12,
+                                    fontWeight: FontWeight.w600)),
                           ],
                         ),
                       ),
-                    );
-                  }).toList(),
-                ),
+                    ),
+                  ),
 
-                // Action row — shown for all modes when no media captured yet
-                if (showCameraRow) ...[
-                  const SizedBox(height: 12),
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-                    crossAxisAlignment: CrossAxisAlignment.center,
+                // Condition chip overlay (bottom of capture area)
+                Positioned(
+                  bottom: 10,
+                  left: 12,
+                  right: 12,
+                  child: Row(
                     children: [
-                      // Left slot: pause/resume while recording, otherwise
-                      // gallery (PHOTO/VIDEO) or spacer (FILE/AUDIO)
-                      if (_currentCaptureMode == 'VIDEO' && _captureUi.isVideoRecording.value)
-                        GestureDetector(
-                          onTap: _triggerVideoPauseResume,
+                      Expanded(
+                        child: GestureDetector(
+                          onTap: () => _showFlagIssuesSheet(item,
+                              autoAdvanceOnConfirm: true),
                           child: Container(
-                            width: 46,
-                            height: 46,
+                            padding: const EdgeInsets.symmetric(
+                                horizontal: 10, vertical: 6),
                             decoration: BoxDecoration(
-                              color: Colors.white.withValues(alpha: 0.12),
-                              shape: BoxShape.circle,
+                              color: Colors.black54,
+                              borderRadius: BorderRadius.circular(20),
                               border: Border.all(
-                                color: _triggerVideoPauseResume != null
-                                    ? Colors.white54
-                                    : Colors.white24,
-                              ),
+                                  color: condColor.withValues(alpha: 0.6)),
                             ),
-                            child: Icon(
-                              _captureUi.isVideoPaused.value ? Icons.play_arrow : Icons.pause,
-                              color: _triggerVideoPauseResume != null
-                                  ? Colors.white
-                                  : Colors.white38,
-                              size: 24,
-                            ),
-                          ),
-                        )
-                      else if (_currentCaptureMode == 'PHOTO' ||
-                          _currentCaptureMode == 'VIDEO')
-                        GestureDetector(
-                          onTap: () => _currentCaptureMode == 'VIDEO'
-                              ? _pickVideo(item, ImageSource.gallery)
-                              : _pickImage(
-                                  ImageSource.gallery, uniqueId, fieldId),
-                          child: Container(
-                            width: 46,
-                            height: 46,
-                            decoration: BoxDecoration(
-                              color: Colors.white.withValues(alpha: 0.1),
-                              shape: BoxShape.circle,
-                              border: Border.all(color: Colors.white24),
-                            ),
-                            child: Icon(
-                              _currentCaptureMode == 'VIDEO'
-                                  ? Icons.video_library_outlined
-                                  : Icons.photo_library_outlined,
-                              color: Colors.white70,
-                              size: 22,
-                            ),
-                          ),
-                        )
-                      else
-                        const SizedBox(width: 46, height: 46),
-
-                      // Centre: main action button for each mode
-                      if (_currentCaptureMode == 'PHOTO')
-                        // Shutter ring
-                        GestureDetector(
-                          onTap: _triggerPhotoCapture,
-                          child: Container(
-                            width: 72,
-                            height: 72,
-                            decoration: BoxDecoration(
-                              shape: BoxShape.circle,
-                              border: Border.all(color: Colors.white, width: 3),
-                            ),
-                            child: Padding(
-                              padding: const EdgeInsets.all(5),
-                              child: Container(
-                                decoration: BoxDecoration(
-                                  color: _triggerPhotoCapture != null
-                                      ? Colors.white
-                                      : Colors.white38,
-                                  shape: BoxShape.circle,
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Icon(condIcon, size: 13, color: condColor),
+                                const SizedBox(width: 6),
+                                Flexible(
+                                  child: Text(
+                                    condLabel,
+                                    style: TextStyle(
+                                      color: condColor,
+                                      fontSize: 12,
+                                      fontWeight: FontWeight.w500,
+                                    ),
+                                    overflow: TextOverflow.ellipsis,
+                                  ),
                                 ),
-                              ),
-                            ),
-                          ),
-                        )
-                      else if (_currentCaptureMode == 'VIDEO')
-                        // Record ring → square stop
-                        GestureDetector(
-                          onTap: _triggerVideoToggle,
-                          child: Container(
-                            width: 72,
-                            height: 72,
-                            decoration: BoxDecoration(
-                              shape: BoxShape.circle,
-                              border: Border.all(
-                                color: _captureUi.isVideoRecording.value
-                                    ? Colors.red
-                                    : Colors.white,
-                                width: 3,
-                              ),
-                            ),
-                            child: Padding(
-                              padding: const EdgeInsets.all(10),
-                              child: AnimatedContainer(
-                                duration: const Duration(milliseconds: 200),
-                                decoration: BoxDecoration(
-                                  color: _captureUi.isVideoRecording.value
-                                      ? Colors.red
-                                      : (_triggerVideoToggle != null
-                                          ? Colors.white
-                                          : Colors.white38),
-                                  borderRadius: BorderRadius.circular(
-                                      _captureUi.isVideoRecording.value ? 4 : 40),
-                                ),
-                              ),
-                            ),
-                          ),
-                        )
-                      else if (_currentCaptureMode == 'FILE')
-                        // Attach button
-                        GestureDetector(
-                          onTap: () => _showFilePickerOptions(item),
-                          child: Container(
-                            width: 72,
-                            height: 72,
-                            decoration: BoxDecoration(
-                              shape: BoxShape.circle,
-                              color: const Color(0xFF4D9EFF)
-                                  .withValues(alpha: 0.15),
-                              border: Border.all(
-                                  color: const Color(0xFF4D9EFF), width: 2.5),
-                            ),
-                            child: const Icon(Icons.attach_file,
-                                color: Color(0xFF4D9EFF), size: 30),
-                          ),
-                        )
-                      else
-                        // AUDIO: toggle recording
-                        GestureDetector(
-                          onTap: () => _isRecordingAudio
-                              ? _stopAudioRecording(item)
-                              : _startAudioRecording(item),
-                          child: Container(
-                            width: 72,
-                            height: 72,
-                            decoration: BoxDecoration(
-                              shape: BoxShape.circle,
-                              color: _isRecordingAudio
-                                  ? Colors.red.withValues(alpha: 0.15)
-                                  : const Color(0xFFEC4899)
-                                      .withValues(alpha: 0.15),
-                              border: Border.all(
-                                color: _isRecordingAudio
-                                    ? Colors.red
-                                    : const Color(0xFFEC4899),
-                                width: 2.5,
-                              ),
-                            ),
-                            child: Icon(
-                              _isRecordingAudio ? Icons.stop : Icons.mic,
-                              color: _isRecordingAudio
-                                  ? Colors.red
-                                  : const Color(0xFFEC4899),
-                              size: 30,
+                              ],
                             ),
                           ),
                         ),
-
-                      // Right slot: flash (PHOTO / VIDEO) or spacer
-                      if (_currentCaptureMode == 'PHOTO' ||
-                          _currentCaptureMode == 'VIDEO')
-                        GestureDetector(
-                          onTap: _triggerFlashToggle != null
-                              ? () {
-                                  _triggerFlashToggle!();
-                                  _captureUi.flashOn.value =
-                                      !_captureUi.flashOn.value;
-                                }
-                              : null,
-                          child: Container(
-                            width: 46,
-                            height: 46,
+                      ),
+                      const SizedBox(width: 8),
+                      GestureDetector(
+                        onTap: () {
+                          _highlightFlagIssues.value = false;
+                          _showFlagIssuesSheet(item,
+                              autoAdvanceOnConfirm: true);
+                        },
+                        child: ValueListenableBuilder<bool>(
+                          valueListenable: _highlightFlagIssues,
+                          builder: (context, highlight, _) => Container(
+                            padding: const EdgeInsets.symmetric(
+                                horizontal: 10, vertical: 6),
                             decoration: BoxDecoration(
-                              color: _captureUi.flashOn.value
-                                  ? const Color(0xFFFFC107)
-                                  : Colors.white.withValues(alpha: 0.1),
-                              shape: BoxShape.circle,
+                              color: highlight
+                                  ? Colors.orange.withValues(alpha: 0.2)
+                                  : Colors.black54,
+                              borderRadius: BorderRadius.circular(20),
                               border: Border.all(
-                                color: _captureUi.flashOn.value
-                                    ? const Color(0xFFFFC107)
-                                    : Colors.white24,
-                              ),
-                            ),
-                            child: Icon(
-                              _captureUi.flashOn.value ? Icons.flash_on : Icons.flash_off,
-                              color: _captureUi.flashOn.value
-                                  ? Colors.black87
-                                  : (_triggerFlashToggle != null
-                                      ? Colors.white70
+                                  color: highlight
+                                      ? Colors.orange
                                       : Colors.white24),
-                              size: 22,
+                            ),
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Icon(Icons.flag_outlined,
+                                    size: 13,
+                                    color: highlight
+                                        ? Colors.orange
+                                        : Colors.white70),
+                                const SizedBox(width: 4),
+                                Text('Flag Issue',
+                                    style: TextStyle(
+                                        color: highlight
+                                            ? Colors.orange
+                                            : Colors.white70,
+                                        fontSize: 12,
+                                        fontWeight: FontWeight.w500)),
+                              ],
                             ),
                           ),
-                        )
-                      else
-                        const SizedBox(width: 46, height: 46),
+                        ),
+                      ),
                     ],
                   ),
-                  const SizedBox(height: 12),
-                ] else ...[
-                  const SizedBox(height: 10),
-                ],
+                ),
               ],
             ),
           ),
-        ),
-      ],
+
+          // ── Bottom control panel ───────────────────────────────────
+          Container(
+            color: const Color(0xFF0D0D0D),
+            padding: const EdgeInsets.fromLTRB(16, 10, 16, 0),
+            child: SafeArea(
+              top: false,
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  // Instruction text
+                  Text(
+                    _currentCaptureMode == 'VIDEO'
+                        ? 'Record a video of: $title'
+                        : _currentCaptureMode == 'FILE'
+                            ? 'Attach a document for: $title'
+                            : _currentCaptureMode == 'AUDIO'
+                                ? 'Add an audio note for: $title'
+                                : 'Take a clear photo of: $title',
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 13,
+                      fontWeight: FontWeight.w500,
+                    ),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                  const SizedBox(height: 8),
+
+                  // Mode tabs — text + underline only
+                  Row(
+                    children: ['FILE', 'PHOTO', 'VIDEO', 'AUDIO'].map((mode) {
+                      final isSelected = mode == _currentCaptureMode;
+                      return Expanded(
+                        child: GestureDetector(
+                          onTap: () {
+                            if (!isSelected) {
+                              _audioTimer?.cancel();
+                              _audioTimer = null;
+                              _audioRecorder?.stop().then((_) {
+                                _audioRecorder?.dispose();
+                                _audioRecorder = null;
+                              });
+                              setState(() {
+                                _currentCaptureMode = mode;
+                                _triggerPhotoCapture = null;
+                                _triggerEnlarge = null;
+                                _triggerFlashToggle = null;
+                                _captureUi.flashOn.value = false;
+                                _triggerVideoToggle = null;
+                                _triggerVideoPauseResume = null;
+                                _captureUi.isVideoRecording.value = false;
+                                _captureUi.isVideoPaused.value = false;
+                                _isRecordingAudio = false;
+                                _audioElapsed.value = Duration.zero;
+                              });
+                            }
+                          },
+                          child: Column(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Text(
+                                mode,
+                                textAlign: TextAlign.center,
+                                style: TextStyle(
+                                  color: isSelected
+                                      ? Colors.white
+                                      : Colors.white38,
+                                  fontSize: 11,
+                                  fontWeight: isSelected
+                                      ? FontWeight.w700
+                                      : FontWeight.w400,
+                                ),
+                              ),
+                              const SizedBox(height: 4),
+                              AnimatedContainer(
+                                duration: const Duration(milliseconds: 200),
+                                height: 2,
+                                decoration: BoxDecoration(
+                                  color: isSelected
+                                      ? const Color(0xFF4D9EFF)
+                                      : Colors.transparent,
+                                  borderRadius: BorderRadius.circular(1),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      );
+                    }).toList(),
+                  ),
+
+                  // Action row — shown for all modes when no media captured yet
+                  if (showCameraRow) ...[
+                    const SizedBox(height: 12),
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                      crossAxisAlignment: CrossAxisAlignment.center,
+                      children: [
+                        // Left slot: pause/resume while recording, otherwise
+                        // gallery (PHOTO/VIDEO) or spacer (FILE/AUDIO)
+                        if (_currentCaptureMode == 'VIDEO' &&
+                            _captureUi.isVideoRecording.value)
+                          GestureDetector(
+                            onTap: _triggerVideoPauseResume,
+                            child: Container(
+                              width: 46,
+                              height: 46,
+                              decoration: BoxDecoration(
+                                color: Colors.white.withValues(alpha: 0.12),
+                                shape: BoxShape.circle,
+                                border: Border.all(
+                                  color: _triggerVideoPauseResume != null
+                                      ? Colors.white54
+                                      : Colors.white24,
+                                ),
+                              ),
+                              child: Icon(
+                                _captureUi.isVideoPaused.value
+                                    ? Icons.play_arrow
+                                    : Icons.pause,
+                                color: _triggerVideoPauseResume != null
+                                    ? Colors.white
+                                    : Colors.white38,
+                                size: 24,
+                              ),
+                            ),
+                          )
+                        else if (_currentCaptureMode == 'PHOTO' ||
+                            _currentCaptureMode == 'VIDEO')
+                          GestureDetector(
+                            onTap: () => _currentCaptureMode == 'VIDEO'
+                                ? _pickVideo(item, ImageSource.gallery)
+                                : _pickImage(
+                                    ImageSource.gallery, uniqueId, fieldId),
+                            child: Container(
+                              width: 46,
+                              height: 46,
+                              decoration: BoxDecoration(
+                                color: Colors.white.withValues(alpha: 0.1),
+                                shape: BoxShape.circle,
+                                border: Border.all(color: Colors.white24),
+                              ),
+                              child: Icon(
+                                _currentCaptureMode == 'VIDEO'
+                                    ? Icons.video_library_outlined
+                                    : Icons.photo_library_outlined,
+                                color: Colors.white70,
+                                size: 22,
+                              ),
+                            ),
+                          )
+                        else
+                          const SizedBox(width: 46, height: 46),
+
+                        // Centre: main action button for each mode
+                        if (_currentCaptureMode == 'PHOTO')
+                          // Shutter ring
+                          GestureDetector(
+                            onTap: _triggerPhotoCapture,
+                            child: Container(
+                              width: 72,
+                              height: 72,
+                              decoration: BoxDecoration(
+                                shape: BoxShape.circle,
+                                border:
+                                    Border.all(color: Colors.white, width: 3),
+                              ),
+                              child: Padding(
+                                padding: const EdgeInsets.all(5),
+                                child: Container(
+                                  decoration: BoxDecoration(
+                                    color: _triggerPhotoCapture != null
+                                        ? Colors.white
+                                        : Colors.white38,
+                                    shape: BoxShape.circle,
+                                  ),
+                                ),
+                              ),
+                            ),
+                          )
+                        else if (_currentCaptureMode == 'VIDEO')
+                          // Record ring → square stop
+                          GestureDetector(
+                            onTap: _triggerVideoToggle,
+                            child: Container(
+                              width: 72,
+                              height: 72,
+                              decoration: BoxDecoration(
+                                shape: BoxShape.circle,
+                                border: Border.all(
+                                  color: _captureUi.isVideoRecording.value
+                                      ? Colors.red
+                                      : Colors.white,
+                                  width: 3,
+                                ),
+                              ),
+                              child: Padding(
+                                padding: const EdgeInsets.all(10),
+                                child: AnimatedContainer(
+                                  duration: const Duration(milliseconds: 200),
+                                  decoration: BoxDecoration(
+                                    color: _captureUi.isVideoRecording.value
+                                        ? Colors.red
+                                        : (_triggerVideoToggle != null
+                                            ? Colors.white
+                                            : Colors.white38),
+                                    borderRadius: BorderRadius.circular(
+                                        _captureUi.isVideoRecording.value
+                                            ? 4
+                                            : 40),
+                                  ),
+                                ),
+                              ),
+                            ),
+                          )
+                        else if (_currentCaptureMode == 'FILE')
+                          // Attach button
+                          GestureDetector(
+                            onTap: () => _showFilePickerOptions(item),
+                            child: Container(
+                              width: 72,
+                              height: 72,
+                              decoration: BoxDecoration(
+                                shape: BoxShape.circle,
+                                color: const Color(0xFF4D9EFF)
+                                    .withValues(alpha: 0.15),
+                                border: Border.all(
+                                    color: const Color(0xFF4D9EFF), width: 2.5),
+                              ),
+                              child: const Icon(Icons.attach_file,
+                                  color: Color(0xFF4D9EFF), size: 30),
+                            ),
+                          )
+                        else
+                          // AUDIO: toggle recording
+                          GestureDetector(
+                            onTap: () => _isRecordingAudio
+                                ? _stopAudioRecording(item)
+                                : _startAudioRecording(item),
+                            child: Container(
+                              width: 72,
+                              height: 72,
+                              decoration: BoxDecoration(
+                                shape: BoxShape.circle,
+                                color: _isRecordingAudio
+                                    ? Colors.red.withValues(alpha: 0.15)
+                                    : const Color(0xFFEC4899)
+                                        .withValues(alpha: 0.15),
+                                border: Border.all(
+                                  color: _isRecordingAudio
+                                      ? Colors.red
+                                      : const Color(0xFFEC4899),
+                                  width: 2.5,
+                                ),
+                              ),
+                              child: Icon(
+                                _isRecordingAudio ? Icons.stop : Icons.mic,
+                                color: _isRecordingAudio
+                                    ? Colors.red
+                                    : const Color(0xFFEC4899),
+                                size: 30,
+                              ),
+                            ),
+                          ),
+
+                        // Right slot: flash (PHOTO / VIDEO) or spacer
+                        if (_currentCaptureMode == 'PHOTO' ||
+                            _currentCaptureMode == 'VIDEO')
+                          GestureDetector(
+                            onTap: _triggerFlashToggle != null
+                                ? () {
+                                    _triggerFlashToggle!();
+                                    _captureUi.flashOn.value =
+                                        !_captureUi.flashOn.value;
+                                  }
+                                : null,
+                            child: Container(
+                              width: 46,
+                              height: 46,
+                              decoration: BoxDecoration(
+                                color: _captureUi.flashOn.value
+                                    ? const Color(0xFFFFC107)
+                                    : Colors.white.withValues(alpha: 0.1),
+                                shape: BoxShape.circle,
+                                border: Border.all(
+                                  color: _captureUi.flashOn.value
+                                      ? const Color(0xFFFFC107)
+                                      : Colors.white24,
+                                ),
+                              ),
+                              child: Icon(
+                                _captureUi.flashOn.value
+                                    ? Icons.flash_on
+                                    : Icons.flash_off,
+                                color: _captureUi.flashOn.value
+                                    ? Colors.black87
+                                    : (_triggerFlashToggle != null
+                                        ? Colors.white70
+                                        : Colors.white24),
+                                size: 22,
+                              ),
+                            ),
+                          )
+                        else
+                          const SizedBox(width: 46, height: 46),
+                      ],
+                    ),
+                    const SizedBox(height: 12),
+                  ] else ...[
+                    const SizedBox(height: 10),
+                  ],
+                ],
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -6657,9 +6925,8 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
           await _commitPendingMediaToQueue();
           if (mounted) {
             ref.read(inspectionProvider.notifier).markDirty();
-            unawaited(ref
-                .read(inspectionProvider.notifier)
-                .refreshMediaQueue());
+            unawaited(
+                ref.read(inspectionProvider.notifier).refreshMediaQueue());
           }
           if (!mounted) return;
           Navigator.of(context).pop();
@@ -6766,7 +7033,8 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
                               _pendingCapturedVideoUniqueId = null;
                             });
                           },
-                          onUseMedia: (int quarterTurns) => _acceptCapturedVideo(quarterTurns),
+                          onUseMedia: (int quarterTurns) =>
+                              _acceptCapturedVideo(quarterTurns),
                         )
                       : _isReviewingAudio && _pendingCapturedAudioPath != null
                           ? InspectionVideoReview(
@@ -6806,7 +7074,8 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
                                       _pendingCapturedUniqueId = null;
                                     });
                                   },
-                                  onUsePhoto: (int quarterTurns) => _acceptCapturedImage(quarterTurns),
+                                  onUsePhoto: (int quarterTurns) =>
+                                      _acceptCapturedImage(quarterTurns),
                                 )
                               : currentItem != null &&
                                       (_itemHasImage(currentItem) ||
@@ -6901,6 +7170,10 @@ class _InspectionScreenState extends ConsumerState<InspectionScreen>
     final clampedField = fieldIndex.clamp(0, sectionItems.length - 1);
     final targetItem =
         sectionItems.isNotEmpty ? sectionItems[clampedField] : null;
+
+    // Moving to a different section — flush the current one's pending edits.
+    if (sectionIndex != _currentSection) _flushDirtySectionsToServer();
+
     setState(() {
       _currentSection = sectionIndex;
       _currentItemIndex = clampedField;

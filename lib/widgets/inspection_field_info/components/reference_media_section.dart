@@ -25,16 +25,15 @@ class ReferenceMediaSectionView extends StatelessWidget {
   const ReferenceMediaSectionView({
     super.key,
     required this.mediaList,
-    this.imageHeight = 340,
+    this.imageHeight = 440,
     this.maxItems,
     this.trailing,
   });
 
   @override
   Widget build(BuildContext context) {
-    final visibleItems = maxItems != null
-        ? mediaList.take(maxItems!).toList()
-        : mediaList;
+    final visibleItems =
+        maxItems != null ? mediaList.take(maxItems!).toList() : mediaList;
 
     return Container(
       padding: const EdgeInsets.all(16),
@@ -97,7 +96,7 @@ class ReferenceMediaSectionView extends StatelessWidget {
                         url: url,
                         width: double.infinity,
                         height: imageHeight,
-                        fit: BoxFit.cover,
+                        fit: BoxFit.fill,
                       ),
                     ),
                   if (mediaType == 'video' && url.isNotEmpty)
@@ -139,44 +138,6 @@ class ReferenceMediaSectionView extends StatelessWidget {
                       ),
                     ),
                   _DescriptionBox(description: media['description'] as String?),
-                  Padding(
-                    padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
-                    child: Row(
-                      children: [
-                        Icon(
-                          mediaType == 'image'
-                              ? Icons.image
-                              : mediaType == 'video'
-                                  ? Icons.videocam
-                                  : mediaType == 'audio'
-                                      ? Icons.audiotrack
-                                      : Icons.link,
-                          size: 14,
-                          color: Colors.grey,
-                        ),
-                        const SizedBox(width: 4),
-                        Text(
-                          mediaType.toUpperCase(),
-                          style: TextStyle(
-                            fontSize: 11,
-                            color: Colors.grey[600],
-                            fontWeight: FontWeight.w600,
-                            letterSpacing: 0.5,
-                          ),
-                        ),
-                        const Spacer(),
-                        Text(
-                          'Tap the media expand',
-                          style: TextStyle(
-                            fontSize: 11,
-                            color: Colors.grey[600],
-                            fontWeight: FontWeight.w600,
-                            letterSpacing: 0.5,
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
                 ],
               ),
             );
@@ -573,7 +534,10 @@ class _DescriptionBox extends StatelessWidget {
       decoration: BoxDecoration(
         color: isUrl
             ? Colors.blue.withAlpha(15)
-            : Theme.of(context).colorScheme.surfaceContainerHighest.withAlpha(80),
+            : Theme.of(context)
+                .colorScheme
+                .surfaceContainerHighest
+                .withAlpha(80),
         borderRadius: BorderRadius.circular(8),
         border: Border.all(
           color: isUrl
@@ -588,7 +552,9 @@ class _DescriptionBox extends StatelessWidget {
               description!.trim(),
               style: TextStyle(
                 fontSize: 13,
-                color: isUrl ? Colors.blue : Theme.of(context).textTheme.bodyMedium?.color,
+                color: isUrl
+                    ? Colors.blue
+                    : Theme.of(context).textTheme.bodyMedium?.color,
                 decoration: isUrl ? TextDecoration.underline : null,
                 decorationColor: Colors.blue,
               ),
@@ -753,14 +719,16 @@ class _CachedReferenceImageState extends State<CachedReferenceImage> {
           child: Center(
             child: CircularProgressIndicator.adaptive(
               value: progress.expectedTotalBytes != null
-                  ? progress.cumulativeBytesLoaded / progress.expectedTotalBytes!
+                  ? progress.cumulativeBytesLoaded /
+                      progress.expectedTotalBytes!
                   : null,
             ),
           ),
         );
       },
       errorBuilder: (_, error, __) {
-        debugPrint('[RefImage] Image.network FAILED ${mediaUri(widget.url)}: $error');
+        debugPrint(
+            '[RefImage] Image.network FAILED ${mediaUri(widget.url)}: $error');
         return _error();
       },
     );

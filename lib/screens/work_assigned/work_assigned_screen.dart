@@ -1,69 +1,16 @@
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:intl/intl.dart';
+
+import '../../models/booking.dart';
+import '../../services/api_services.dart';
+import '../../services/notification_service.dart';
 import '../home/car_spy/car_spy_data.dart';
+import 'booking_detail_screen.dart';
 
-enum TaskPriority { urgent, standard }
-
-class AssignedTask {
-  const AssignedTask({
-    required this.id,
-    required this.vehicleName,
-    required this.location,
-    required this.timeSlot,
-    required this.priority,
-    this.isCompleted = false,
-  });
-
-  final String id;
-  final String vehicleName;
-  final String location;
-  final String timeSlot;
-  final TaskPriority priority;
-  final bool isCompleted;
-}
-
-const _mockTasks = [
-  AssignedTask(
-    id: '1',
-    vehicleName: '2022 Tesla Model 3',
-    location: 'Downtown Charging Station, Lot B',
-    timeSlot: 'Today, 10:00 AM - 11:30 AM',
-    priority: TaskPriority.urgent,
-  ),
-  AssignedTask(
-    id: '2',
-    vehicleName: '2019 Ford F-150',
-    location: 'Northside Depot, Bay 4',
-    timeSlot: 'Today, 1:00 PM - 2:00 PM',
-    priority: TaskPriority.standard,
-  ),
-  AssignedTask(
-    id: '3',
-    vehicleName: '2021 Toyota Camry',
-    location: 'Airport Rental Lot, Sector C',
-    timeSlot: 'Tomorrow, 9:00 AM - 10:00 AM',
-    priority: TaskPriority.standard,
-  ),
-];
-
-final _initialCompletedTasks = [
-  const AssignedTask(
-    id: '4',
-    vehicleName: '2020 Honda Civic',
-    location: 'West Side Garage, Level 2',
-    timeSlot: 'Yesterday, 2:00 PM - 3:00 PM',
-    priority: TaskPriority.standard,
-    isCompleted: true,
-  ),
-  const AssignedTask(
-    id: '5',
-    vehicleName: '2023 BMW X5',
-    location: 'Central Hub, Bay 1',
-    timeSlot: 'Yesterday, 11:00 AM - 12:30 PM',
-    priority: TaskPriority.urgent,
-    isCompleted: true,
-  ),
-];
-
+/// The inspector's assigned inspection jobs, backed by
+/// `GET /api/inspector/bookings`. Three filter tabs — Today / Upcoming / Past —
+/// each drive the `filter` query param. Tapping a job opens its workflow.
 class WorkAssignedScreen extends StatefulWidget {
   const WorkAssignedScreen({super.key});
 
@@ -73,15 +20,24 @@ class WorkAssignedScreen extends StatefulWidget {
 
 class _WorkAssignedScreenState extends State<WorkAssignedScreen>
     with SingleTickerProviderStateMixin {
-  late TabController _tabController;
-  final List<AssignedTask> _assignedTasks = List.from(_mockTasks);
-  final List<AssignedTask> _completedTasks = [];
+  static const _filters = ['today', 'upcoming', 'past'];
+  static const _labels = ['Today', 'Upcoming', 'Past'];
+
+  /// Whether each tab shows its job count in the label. Per the design, Today
+  /// and Upcoming do; Past stays plain.
+  static const _showCount = [true, true, false];
+
+  late final TabController _tabController;
+
+  /// Total job count per filter, reported by each list once it loads. Null until
+  /// the first successful fetch (so the label shows no badge yet).
+  final Map<String, int?> _counts = {};
 
   @override
   void initState() {
     super.initState();
-    _tabController = TabController(length: 2, vsync: this);
-    _completedTasks.addAll(_initialCompletedTasks);
+    _tabController = TabController(length: _filters.length, vsync: this);
+    _prefetchCounts();
   }
 
   @override
@@ -90,227 +46,334 @@ class _WorkAssignedScreenState extends State<WorkAssignedScreen>
     super.dispose();
   }
 
-  void _onAccept(AssignedTask task) {
-    setState(() {
-      _assignedTasks.removeWhere((t) => t.id == task.id);
-    });
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text('Accepted: ${task.vehicleName}'),
-        backgroundColor: CarSpyColors.primary,
-        behavior: SnackBarBehavior.floating,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+  /// Load the badge counts up front so they show without opening each tab. The
+  /// currently-visible tab loads its own data (and reports its count), so we
+  /// only prefetch the other badged tabs with a minimal `per_page: 1` request.
+  void _prefetchCounts() {
+    for (var i = 0; i < _filters.length; i++) {
+      if (!_showCount[i] || i == _tabController.index) continue;
+      _fetchCount(_filters[i]);
+    }
+  }
+
+  Future<void> _fetchCount(String filter) async {
+    final res =
+        await ApiService.getInspectorBookings(filter: filter, perPage: 1);
+    if (!mounted || res['success'] != true) return;
+    final total =
+        res['pagination']?.total ?? (res['bookings'] as List).length;
+    _setCount(filter, total);
+  }
+
+  void _setCount(String filter, int count) {
+    if (_counts[filter] == count) return;
+    if (mounted) setState(() => _counts[filter] = count);
+  }
+
+  /// A tab label; for Today/Upcoming it appends a count badge once known.
+  Widget _buildTab(int index) {
+    final count = _counts[_filters[index]];
+    final showBadge = _showCount[index] && count != null;
+    return Tab(
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(_labels[index]),
+          if (showBadge) ...[
+            const SizedBox(width: 6),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+              decoration: BoxDecoration(
+                color: count == 0
+                    ? const Color(0xFFE2E8F0)
+                    : CarSpyColors.primary,
+                borderRadius: BorderRadius.circular(20),
+              ),
+              child: Text(
+                '$count',
+                style: TextStyle(
+                  fontSize: 11,
+                  fontWeight: FontWeight.w700,
+                  color: count == 0
+                      ? CarSpyColors.onSurfaceVariant
+                      : Colors.white,
+                ),
+              ),
+            ),
+          ],
+        ],
       ),
     );
   }
 
-  void _onReject(AssignedTask task) {
-    setState(() {
-      _assignedTasks.removeWhere((t) => t.id == task.id);
-    });
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text('Rejected: ${task.vehicleName}'),
-        backgroundColor: Colors.redAccent,
-        behavior: SnackBarBehavior.floating,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-      ),
+  /// Debug helper — fires a local notification of the given type. Tapping it
+  /// should route to Work Assigned (assignment/today) or Attendance (reminders).
+  void _fireTestNotification(String type) {
+    const titles = {
+      'inspection_assigned': 'New inspection assigned',
+      'inspections_today': "Today's inspections",
+      'attendance_check_in_reminder': 'Check-in reminder',
+      'attendance_check_out_reminder': 'Check-out reminder',
+    };
+    const bodies = {
+      'inspection_assigned': 'Swift Dzire — 18 Jun at 10:30',
+      'inspections_today': 'Swift Dzire 09:30, i20 14:00',
+      'attendance_check_in_reminder': 'You have 2 inspections today. Check in.',
+      'attendance_check_out_reminder': "Don't forget to check out for today.",
+    };
+    NotificationService.showLocal(
+      title: titles[type] ?? 'Certifide',
+      body: bodies[type] ?? '',
+      type: type,
     );
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: const Color(0xFFF4F7FA),
+      backgroundColor: CarSpyColors.surface,
       appBar: AppBar(
         backgroundColor: Colors.white,
         elevation: 0,
+        automaticallyImplyLeading: false,
         title: const Text(
-          'CarSpy',
+          'Work Assigned',
           style: TextStyle(
-            fontSize: 18,
+            fontSize: 20,
             fontWeight: FontWeight.w700,
             color: Color(0xFF172B4D),
           ),
         ),
-        centerTitle: true,
-      ),
-      body: Column(
-        children: [
-          _HeaderSection(pendingCount: _assignedTasks.length),
-          _TabBar(controller: _tabController),
-          Expanded(
-            child: TabBarView(
-              controller: _tabController,
-              children: [
-                _TaskList(
-                  tasks: _assignedTasks,
-                  onAccept: _onAccept,
-                  onReject: _onReject,
+        actions: [
+          // Debug-only: fire a local test notification to verify display + the
+          // tap-to-tab routing without waiting on the backend. Stripped from
+          // release builds.
+          if (kDebugMode)
+            PopupMenuButton<String>(
+              icon: const Icon(Icons.notifications_active_outlined,
+                  color: Color(0xFF172B4D)),
+              tooltip: 'Test notification',
+              onSelected: _fireTestNotification,
+              itemBuilder: (_) => const [
+                PopupMenuItem(
+                  value: 'inspection_assigned',
+                  child: Text('Inspection assigned → Work Assigned'),
                 ),
-                _TaskList(
-                  tasks: _completedTasks,
-                  showActions: false,
+                PopupMenuItem(
+                  value: 'inspections_today',
+                  child: Text("Today's inspections → Work Assigned"),
+                ),
+                PopupMenuItem(
+                  value: 'attendance_check_in_reminder',
+                  child: Text('Check-in reminder → Attendance'),
+                ),
+                PopupMenuItem(
+                  value: 'attendance_check_out_reminder',
+                  child: Text('Check-out reminder → Attendance'),
                 ),
               ],
             ),
-          ),
         ],
+        bottom: TabBar(
+          controller: _tabController,
+          indicatorColor: CarSpyColors.primary,
+          indicatorWeight: 2.5,
+          labelColor: CarSpyColors.primary,
+          unselectedLabelColor: CarSpyColors.onSurfaceVariant,
+          labelStyle:
+              const TextStyle(fontSize: 15, fontWeight: FontWeight.w600),
+          tabs: [
+            for (var i = 0; i < _labels.length; i++) _buildTab(i),
+          ],
+        ),
       ),
-    );
-  }
-}
-
-class _HeaderSection extends StatelessWidget {
-  const _HeaderSection({required this.pendingCount});
-
-  final int pendingCount;
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      color: Colors.white,
-      padding: const EdgeInsets.fromLTRB(20, 16, 20, 0),
-      child: Row(
+      body: TabBarView(
+        controller: _tabController,
         children: [
-          const CircleAvatar(
-            radius: 24,
-            backgroundColor: CarSpyColors.surface,
-            child: Icon(Icons.person,
-                color: CarSpyColors.onSurfaceVariant, size: 28),
-          ),
-          const SizedBox(width: 14),
-          Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const Text(
-                'Work Tasks',
-                style: TextStyle(
-                  fontSize: 22,
-                  fontWeight: FontWeight.w800,
-                  color: Color(0xFF172B4D),
-                ),
-              ),
-              Text(
-                '$pendingCount Pending Inspections',
-                style: const TextStyle(
-                  fontSize: 13,
-                  color: Color(0xFF44546F),
-                ),
-              ),
-            ],
-          ),
+          for (final f in _filters)
+            _BookingList(filter: f, onCount: (c) => _setCount(f, c)),
         ],
       ),
     );
   }
 }
 
-class _TabBar extends StatelessWidget {
-  const _TabBar({required this.controller});
+/// A paginated, refreshable list of bookings for one filter.
+class _BookingList extends StatefulWidget {
+  const _BookingList({required this.filter, this.onCount});
 
-  final TabController controller;
+  final String filter;
+
+  /// Reports the total job count for this filter (from pagination) so the parent
+  /// can badge the tab.
+  final ValueChanged<int>? onCount;
 
   @override
-  Widget build(BuildContext context) {
-    return Container(
-      color: Colors.white,
-      child: TabBar(
-        controller: controller,
-        indicatorColor: CarSpyColors.primary,
-        indicatorWeight: 2.5,
-        labelColor: CarSpyColors.primary,
-        unselectedLabelColor: CarSpyColors.onSurfaceVariant,
-        labelStyle: const TextStyle(fontSize: 15, fontWeight: FontWeight.w600),
-        unselectedLabelStyle:
-            const TextStyle(fontSize: 15, fontWeight: FontWeight.w500),
-        tabs: const [
-          Tab(text: 'Assigned'),
-          Tab(text: 'Completed'),
-        ],
-      ),
-    );
-  }
+  State<_BookingList> createState() => _BookingListState();
 }
 
-class _TaskList extends StatelessWidget {
-  const _TaskList({
-    required this.tasks,
-    this.onAccept,
-    this.onReject,
-    this.showActions = true,
-  });
+class _BookingListState extends State<_BookingList>
+    with AutomaticKeepAliveClientMixin {
+  final _scrollController = ScrollController();
+  final List<Booking> _bookings = [];
 
-  final List<AssignedTask> tasks;
-  final void Function(AssignedTask)? onAccept;
-  final void Function(AssignedTask)? onReject;
-  final bool showActions;
+  bool _loading = false;
+  bool _loadingMore = false;
+  bool _hasMore = true;
+  int _page = 1;
+  String? _error;
+
+  @override
+  bool get wantKeepAlive => true;
+
+  @override
+  void initState() {
+    super.initState();
+    _scrollController.addListener(_onScroll);
+    _load(reset: true);
+  }
+
+  @override
+  void dispose() {
+    _scrollController.dispose();
+    super.dispose();
+  }
+
+  void _onScroll() {
+    if (_scrollController.position.pixels >=
+            _scrollController.position.maxScrollExtent - 300 &&
+        !_loadingMore &&
+        _hasMore) {
+      _load();
+    }
+  }
+
+  Future<void> _load({bool reset = false}) async {
+    if (reset) {
+      setState(() {
+        _loading = true;
+        _error = null;
+        _page = 1;
+        _hasMore = true;
+      });
+    } else {
+      if (_loadingMore || !_hasMore) return;
+      setState(() => _loadingMore = true);
+    }
+
+    final res = await ApiService.getInspectorBookings(
+      filter: widget.filter,
+      page: reset ? 1 : _page,
+    );
+    if (!mounted) return;
+
+    int? total;
+    setState(() {
+      _loading = false;
+      _loadingMore = false;
+      if (res['success'] == true) {
+        final list = (res['bookings'] as List).cast<Booking>();
+        if (reset) _bookings.clear();
+        _bookings.addAll(list);
+        final pagination = res['pagination'];
+        _hasMore = pagination?.hasMore ?? false;
+        if (_hasMore) _page = (pagination?.currentPage ?? _page) + 1;
+        // Prefer the server's total; fall back to what we've loaded.
+        total = pagination?.total ?? _bookings.length;
+      } else {
+        _error = res['message']?.toString() ?? 'Failed to load bookings.';
+      }
+    });
+    if (total != null) widget.onCount?.call(total!);
+  }
+
+  Future<void> _openBooking(Booking b) async {
+    final changed = await Navigator.push<bool>(
+      context,
+      MaterialPageRoute(
+        builder: (_) => BookingDetailScreen(bookingId: b.id),
+      ),
+    );
+    if (changed == true) _load(reset: true);
+  }
 
   @override
   Widget build(BuildContext context) {
-    if (tasks.isEmpty) {
-      return const Center(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(Icons.assignment_turned_in_outlined,
-                size: 56, color: CarSpyColors.outlineVariant),
-            SizedBox(height: 12),
-            Text(
-              'No tasks here',
-              style: TextStyle(
-                fontSize: 16,
-                color: CarSpyColors.onSurfaceVariant,
-                fontWeight: FontWeight.w500,
-              ),
-            ),
+    super.build(context);
+
+    if (_loading && _bookings.isEmpty) {
+      return const Center(child: CircularProgressIndicator());
+    }
+    if (_error != null && _bookings.isEmpty) {
+      return _ErrorView(message: _error!, onRetry: () => _load(reset: true));
+    }
+    if (_bookings.isEmpty) {
+      return RefreshIndicator(
+        onRefresh: () => _load(reset: true),
+        child: ListView(
+          children: const [
+            SizedBox(height: 120),
+            _EmptyView(),
           ],
         ),
       );
     }
 
-    return ListView.builder(
-      padding: const EdgeInsets.fromLTRB(16, 16, 16, 24),
-      itemCount: tasks.length,
-      itemBuilder: (context, index) => _TaskCard(
-        task: tasks[index],
-        onAccept: onAccept,
-        onReject: onReject,
-        showActions: showActions,
+    return RefreshIndicator(
+      onRefresh: () => _load(reset: true),
+      child: ListView.builder(
+        controller: _scrollController,
+        padding: const EdgeInsets.fromLTRB(16, 16, 16, 24),
+        itemCount: _bookings.length + (_hasMore ? 1 : 0),
+        itemBuilder: (context, index) {
+          if (index >= _bookings.length) {
+            return const Padding(
+              padding: EdgeInsets.symmetric(vertical: 16),
+              child: Center(child: CircularProgressIndicator()),
+            );
+          }
+          return _BookingCard(
+            booking: _bookings[index],
+            onTap: () => _openBooking(_bookings[index]),
+          );
+        },
       ),
     );
   }
 }
 
-class _TaskCard extends StatelessWidget {
-  const _TaskCard({
-    required this.task,
-    this.onAccept,
-    this.onReject,
-    this.showActions = true,
-  });
+class _BookingCard extends StatelessWidget {
+  const _BookingCard({required this.booking, required this.onTap});
 
-  final AssignedTask task;
-  final void Function(AssignedTask)? onAccept;
-  final void Function(AssignedTask)? onReject;
-  final bool showActions;
+  final Booking booking;
+  final VoidCallback onTap;
+
+  static const _green = Color(0xFF10B981);
+  static const _amber = Color(0xFFF59E0B);
+  static const _primary = CarSpyColors.primary;
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      margin: const EdgeInsets.only(bottom: 14),
-      decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(16),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.black.withValues(alpha: 0.06),
-            blurRadius: 12,
-            offset: const Offset(0, 4),
-          ),
-        ],
-      ),
-      child: Padding(
+    final b = booking;
+    final dateStr =
+        b.bookingDate != null ? DateFormat('d MMM').format(b.bookingDate!) : '';
+    final timeStr = b.assignedTime ?? (b.slot != null ? 'Slot ${b.slot}' : '');
+
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        margin: const EdgeInsets.only(bottom: 14),
+        decoration: BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.circular(16),
+          boxShadow: [
+            BoxShadow(
+              color: Colors.black.withValues(alpha: 0.06),
+              blurRadius: 12,
+              offset: const Offset(0, 4),
+            ),
+          ],
+        ),
         padding: const EdgeInsets.all(16),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
@@ -320,7 +383,7 @@ class _TaskCard extends StatelessWidget {
               children: [
                 Expanded(
                   child: Text(
-                    task.vehicleName,
+                    b.vehicleTitle,
                     style: const TextStyle(
                       fontSize: 16,
                       fontWeight: FontWeight.w700,
@@ -329,85 +392,75 @@ class _TaskCard extends StatelessWidget {
                   ),
                 ),
                 const SizedBox(width: 8),
-                _PriorityBadge(priority: task.priority),
+                _statusBadge(b),
               ],
             ),
+            const SizedBox(height: 4),
+            Text('Order ${b.orderId}',
+                style: const TextStyle(
+                    fontSize: 12, color: CarSpyColors.onSurfaceVariant)),
             const SizedBox(height: 10),
-            _InfoRow(
-              icon: Icons.location_on_outlined,
-              text: task.location,
-            ),
+            _infoRow(Icons.location_on_outlined, b.shortAddress),
             const SizedBox(height: 6),
-            _InfoRow(
-              icon: Icons.access_time_rounded,
-              text: task.timeSlot,
+            _infoRow(
+              Icons.access_time_rounded,
+              [dateStr, timeStr].where((e) => e.isNotEmpty).join(' · '),
             ),
-            if (showActions) ...[
-              const SizedBox(height: 16),
-              Row(
-                children: [
-                  Expanded(
-                    child: _ActionButton(
-                      label: 'Reject',
-                      icon: Icons.close,
-                      onTap: () => onReject?.call(task),
-                      filled: false,
-                    ),
-                  ),
-                  const SizedBox(width: 12),
-                  Expanded(
-                    child: _ActionButton(
-                      label: 'Accept',
-                      icon: Icons.check,
-                      onTap: () => onAccept?.call(task),
-                      filled: true,
-                    ),
-                  ),
-                ],
-              ),
-            ],
+            const SizedBox(height: 12),
+            _progressBar(b),
           ],
         ),
       ),
     );
   }
-}
 
-class _PriorityBadge extends StatelessWidget {
-  const _PriorityBadge({required this.priority});
+  Widget _statusBadge(Booking b) {
+    if (b.isFullyDone) {
+      return _pill('DONE', const Color(0xFFECFDF5), _green);
+    }
+    if (b.inspectionCompleted) {
+      return _pill('REPORT PENDING', const Color(0xFFFFFBEB), _amber);
+    }
+    if (b.hasArrived) {
+      return _pill('IN PROGRESS', const Color(0xFFEFF6FF), _primary);
+    }
+    return _pill(b.status.toUpperCase(), const Color(0xFFEFF6FF), _primary);
+  }
 
-  final TaskPriority priority;
-
-  @override
-  Widget build(BuildContext context) {
-    final isUrgent = priority == TaskPriority.urgent;
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-      decoration: BoxDecoration(
-        color: isUrgent ? const Color(0xFFEEF2FF) : const Color(0xFFF1F3F5),
-        borderRadius: BorderRadius.circular(20),
-      ),
-      child: Text(
-        isUrgent ? 'Urgent' : 'Standard',
-        style: TextStyle(
-          fontSize: 12,
-          fontWeight: FontWeight.w600,
-          color:
-              isUrgent ? CarSpyColors.primary : CarSpyColors.onSurfaceVariant,
+  Widget _progressBar(Booking b) {
+    final steps = [
+      b.whatsappIntimated,
+      b.hasArrived,
+      b.inspectionStarted,
+      b.inspectionCompleted,
+      b.reportUploaded,
+    ];
+    final done = steps.where((e) => e).length;
+    return Row(
+      children: [
+        Expanded(
+          child: ClipRRect(
+            borderRadius: BorderRadius.circular(4),
+            child: LinearProgressIndicator(
+              value: done / steps.length,
+              minHeight: 6,
+              backgroundColor: const Color(0xFFE2E8F0),
+              valueColor: AlwaysStoppedAnimation(
+                  b.isFullyDone ? _green : _primary),
+            ),
+          ),
         ),
-      ),
+        const SizedBox(width: 10),
+        Text('$done/${steps.length}',
+            style: const TextStyle(
+                fontSize: 12,
+                fontWeight: FontWeight.w600,
+                color: CarSpyColors.onSurfaceVariant)),
+      ],
     );
   }
-}
 
-class _InfoRow extends StatelessWidget {
-  const _InfoRow({required this.icon, required this.text});
-
-  final IconData icon;
-  final String text;
-
-  @override
-  Widget build(BuildContext context) {
+  Widget _infoRow(IconData icon, String text) {
     return Row(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -415,61 +468,71 @@ class _InfoRow extends StatelessWidget {
         const SizedBox(width: 6),
         Expanded(
           child: Text(
-            text,
+            text.isEmpty ? '—' : text,
             style: const TextStyle(
-              fontSize: 13,
-              color: CarSpyColors.onSurfaceVariant,
-            ),
+                fontSize: 13, color: CarSpyColors.onSurfaceVariant),
           ),
         ),
       ],
     );
   }
+
+  Widget _pill(String text, Color bg, Color fg) => Container(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+        decoration:
+            BoxDecoration(color: bg, borderRadius: BorderRadius.circular(20)),
+        child: Text(text,
+            style: TextStyle(
+                fontSize: 10.5, fontWeight: FontWeight.w700, color: fg)),
+      );
 }
 
-class _ActionButton extends StatelessWidget {
-  const _ActionButton({
-    required this.label,
-    required this.icon,
-    required this.onTap,
-    required this.filled,
-  });
-
-  final String label;
-  final IconData icon;
-  final VoidCallback onTap;
-  final bool filled;
+class _EmptyView extends StatelessWidget {
+  const _EmptyView();
 
   @override
   Widget build(BuildContext context) {
-    return GestureDetector(
-      onTap: onTap,
-      child: Container(
-        height: 44,
-        decoration: BoxDecoration(
-          color: filled ? CarSpyColors.primary : Colors.white,
-          borderRadius: BorderRadius.circular(10),
-          border: filled
-              ? null
-              : Border.all(color: CarSpyColors.outlineVariant, width: 1.5),
-        ),
-        child: Row(
-          mainAxisAlignment: MainAxisAlignment.center,
+    return const Center(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(Icons.assignment_turned_in_outlined,
+              size: 56, color: CarSpyColors.outlineVariant),
+          SizedBox(height: 12),
+          Text(
+            'No jobs here',
+            style: TextStyle(
+              fontSize: 16,
+              color: CarSpyColors.onSurfaceVariant,
+              fontWeight: FontWeight.w500,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _ErrorView extends StatelessWidget {
+  const _ErrorView({required this.message, required this.onRetry});
+
+  final String message;
+  final VoidCallback onRetry;
+
+  @override
+  Widget build(BuildContext context) {
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
           children: [
-            Icon(
-              icon,
-              size: 18,
-              color: filled ? Colors.white : CarSpyColors.onSurface,
-            ),
-            const SizedBox(width: 6),
-            Text(
-              label,
-              style: TextStyle(
-                fontSize: 14,
-                fontWeight: FontWeight.w600,
-                color: filled ? Colors.white : CarSpyColors.onSurface,
-              ),
-            ),
+            const Icon(Icons.error_outline,
+                size: 48, color: CarSpyColors.onSurfaceVariant),
+            const SizedBox(height: 12),
+            Text(message, textAlign: TextAlign.center),
+            const SizedBox(height: 16),
+            FilledButton(onPressed: onRetry, child: const Text('Retry')),
           ],
         ),
       ),

@@ -37,6 +37,19 @@ target 'Runner' do
 end
 
 post_install do |installer|
+  # IosAwnCore (pulled in by awesome_notifications) builds with
+  # BUILD_LIBRARY_FOR_DISTRIBUTION = YES, and CocoaPods propagates that into the
+  # Pods-Runner aggregate xcconfig that the app target inherits. That makes Swift
+  # emit a module interface for Runner, which is incompatible with its bridging
+  # header — the build fails with "Using bridging headers with module interfaces
+  # is unsupported". Pin the app target back to NO; the pods keep their own value.
+  installer.aggregate_targets.each do |aggregate_target|
+    aggregate_target.xcconfigs.each do |config_name, config_file|
+      config_file.attributes['BUILD_LIBRARY_FOR_DISTRIBUTION'] = 'NO'
+      config_file.save_as(aggregate_target.xcconfig_path(config_name))
+    end
+  end
+
   installer.pods_project.targets.each do |target|
     flutter_additional_ios_build_settings(target)
     target.build_configurations.each do |config|

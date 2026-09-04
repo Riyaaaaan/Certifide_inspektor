@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Certifide brand teal, taken from the logo mark (assets/images/certifide.svg).
+         Android tints the notification small icon with this and uses it as the
+         header accent, so it must match the logo it sits next to. -->
+    <color name="notification_accent">#3DA0AE</color>
+</resources>

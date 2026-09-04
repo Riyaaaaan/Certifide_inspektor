@@ -31,6 +31,23 @@ class NotificationService {
   static const String _channelKey = 'certifide_inspektor_channel';
   static const String _channelGroupKey = 'certifide_inspektor_group';
 
+  /// Status-bar icon: a white-on-transparent silhouette of the Certifide
+  /// magnifier mark (res/drawable-*/res_notification.png, 24dp at every
+  /// density). Android masks this by alpha and tints it with the channel
+  /// colour, so it must stay monochrome — a full-colour bitmap here renders
+  /// as a solid white blob. Kept in sync with the
+  /// `default_notification_icon` manifest meta-data, which covers the
+  /// OS-drawn tray path.
+  static const String _smallIcon = 'resource://drawable/res_notification';
+
+  /// The full-colour logo mark shown as the notification's large icon
+  /// (res/drawable-nodpi/res_certifide_logo.png).
+  static const String _largeIcon = 'resource://drawable/res_certifide_logo';
+
+  /// Certifide brand teal, matching `@color/notification_accent`. Tints the
+  /// small icon and the notification header.
+  static const Color _brandColor = Color(0xFF3DA0AE);
+
   /// Attach to [MaterialApp.navigatorKey] so taps can navigate.
   static final GlobalKey<NavigatorState> navigatorKey =
       GlobalKey<NavigatorState>();
@@ -53,9 +70,7 @@ class NotificationService {
     _initialized = true;
 
     await AwesomeNotifications().initialize(
-      // Uses the app launcher icon; a dedicated white monochrome icon at
-      // res/drawable/res_notification can be swapped in later if desired.
-      null,
+      _smallIcon,
       [
         NotificationChannel(
           channelGroupKey: _channelGroupKey,
@@ -63,8 +78,11 @@ class NotificationService {
           channelName: 'Certifide Inspektor',
           channelDescription:
               'Inspection assignments, daily jobs and attendance reminders',
-          defaultColor: const Color(0xFF3B82F6),
-          ledColor: const Color(0xFF3B82F6),
+          // Per-channel default, used for any notification on this channel
+          // that doesn't name an icon of its own.
+          icon: _smallIcon,
+          defaultColor: _brandColor,
+          ledColor: _brandColor,
           importance: NotificationImportance.High,
           channelShowBadge: true,
           playSound: true,
@@ -210,6 +228,11 @@ class NotificationService {
           title: title,
           body: body,
           notificationLayout: NotificationLayout.Default,
+          // Brand the notification itself: monochrome mark in the status bar
+          // and header, full-colour mark as the large icon on the right.
+          icon: _smallIcon,
+          largeIcon: _largeIcon,
+          color: _brandColor,
           payload: data.map((k, v) => MapEntry(k, v.toString())),
         ),
       );

@@ -63,7 +63,7 @@ final class ConnectivityStatusProvider
 }
 
 String _$connectivityStatusHash() =>
-    r'e414335b9d1872a596965694151d7b02248cf4c9';
+    r'ee4f7848e0364e8dfd11075a8d73643f40f47d78';
 
 /// Single source of truth for whether the app can currently reach the backend.
 ///

@@ -1,84 +1,85 @@
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:intl/intl.dart';
 
 import '../../models/booking.dart';
-import '../../services/api_services.dart';
+import '../../providers/bookings_provider.dart';
 import '../../services/notification_service.dart';
 import '../home/car_spy/car_spy_data.dart';
 import 'booking_detail_screen.dart';
 
 /// The inspector's assigned inspection jobs, backed by
-/// `GET /api/inspector/bookings`. Three filter tabs — Today / Upcoming / Past —
-/// each drive the `filter` query param. Tapping a job opens its workflow.
-class WorkAssignedScreen extends StatefulWidget {
+/// `GET /api/inspector/bookings`. Four tabs — Today / Upcoming / Past / Done
+/// (see [WorkTab]). Tapping a job opens its workflow.
+///
+/// The lists refetch on their own when work is assigned, so a new job appears
+/// without a manual pull-to-refresh: every list watches
+/// [assignmentsRevisionProvider], which an assignment push bumps.
+class WorkAssignedScreen extends ConsumerStatefulWidget {
   const WorkAssignedScreen({super.key});
 
   @override
-  State<WorkAssignedScreen> createState() => _WorkAssignedScreenState();
+  ConsumerState<WorkAssignedScreen> createState() => _WorkAssignedScreenState();
 }
 
-class _WorkAssignedScreenState extends State<WorkAssignedScreen>
-    with SingleTickerProviderStateMixin {
-  static const _filters = ['today', 'upcoming', 'past'];
-  static const _labels = ['Today', 'Upcoming', 'Past'];
-
-  /// Whether each tab shows its job count in the label. Per the design, Today
-  /// and Upcoming do; Past stays plain.
-  static const _showCount = [true, true, false];
-
+class _WorkAssignedScreenState extends ConsumerState<WorkAssignedScreen>
+    with SingleTickerProviderStateMixin, WidgetsBindingObserver {
   late final TabController _tabController;
 
-  /// Total job count per filter, reported by each list once it loads. Null until
-  /// the first successful fetch (so the label shows no badge yet).
-  final Map<String, int?> _counts = {};
+  /// Whether the app has actually been backgrounded since the last refresh.
+  /// `inactive` alone is not enough to refetch on: a heads-up notification, the
+  /// notification shade, a permission dialog and the app switcher all bounce
+  /// through inactive→resumed while the screen stays visible, and each one
+  /// would otherwise cost a full reload of every tab.
+  bool _wasBackgrounded = false;
 
   @override
   void initState() {
     super.initState();
-    _tabController = TabController(length: _filters.length, vsync: this);
-    _prefetchCounts();
+    _tabController = TabController(length: WorkTab.values.length, vsync: this);
+    // The home shell keeps this screen alive in an IndexedStack, so initState
+    // runs once per session — hence the lifecycle observer rather than a
+    // refresh on first build.
+    WidgetsBinding.instance.addObserver(this);
   }
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _tabController.dispose();
     super.dispose();
   }
 
-  /// Load the badge counts up front so they show without opening each tab. The
-  /// currently-visible tab loads its own data (and reports its count), so we
-  /// only prefetch the other badged tabs with a minimal `per_page: 1` request.
-  void _prefetchCounts() {
-    for (var i = 0; i < _filters.length; i++) {
-      if (!_showCount[i] || i == _tabController.index) continue;
-      _fetchCount(_filters[i]);
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // Covers a push that arrived while the app was backgrounded and was drawn
+    // by the OS: no Dart code ran for it, and the inspector may open the app
+    // from the launcher rather than by tapping the notification.
+    if (state == AppLifecycleState.paused ||
+        state == AppLifecycleState.hidden ||
+        state == AppLifecycleState.detached) {
+      _wasBackgrounded = true;
+    } else if (state == AppLifecycleState.resumed && _wasBackgrounded) {
+      _wasBackgrounded = false;
+      ref.read(assignmentsRevisionProvider.notifier).bump();
     }
   }
 
-  Future<void> _fetchCount(String filter) async {
-    final res =
-        await ApiService.getInspectorBookings(filter: filter, perPage: 1);
-    if (!mounted || res['success'] != true) return;
-    final total =
-        res['pagination']?.total ?? (res['bookings'] as List).length;
-    _setCount(filter, total);
-  }
-
-  void _setCount(String filter, int count) {
-    if (_counts[filter] == count) return;
-    if (mounted) setState(() => _counts[filter] = count);
-  }
-
-  /// A tab label; for Today/Upcoming it appends a count badge once known.
-  Widget _buildTab(int index) {
-    final count = _counts[_filters[index]];
-    final showBadge = _showCount[index] && count != null;
+  /// A tab label; Today/Upcoming append a count badge once known.
+  Widget _buildTab(WorkTab tab) {
+    // Watching the tab's own provider for the badge also warms it, so switching
+    // to Today or Upcoming shows data immediately.
+    final count = tab.showsCount
+        ? ref.watch(
+            bookingListProvider(tab).select((s) => s.value?.total))
+        : null;
+    final showBadge = tab.showsCount && count != null;
     return Tab(
       child: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
-          Text(_labels[index]),
+          Text(tab.label),
           if (showBadge) ...[
             const SizedBox(width: 6),
             Container(
@@ -176,52 +177,43 @@ class _WorkAssignedScreenState extends State<WorkAssignedScreen>
         ],
         bottom: TabBar(
           controller: _tabController,
+          // Scrollable so the tabs size to their content: four fixed tabs
+          // overflowed once Done was added, and a two-digit count badge would
+          // push it further. Left-aligned, so it still reads as a normal tab
+          // row while it fits.
+          isScrollable: true,
+          tabAlignment: TabAlignment.start,
+          labelPadding: const EdgeInsets.symmetric(horizontal: 14),
           indicatorColor: CarSpyColors.primary,
           indicatorWeight: 2.5,
           labelColor: CarSpyColors.primary,
           unselectedLabelColor: CarSpyColors.onSurfaceVariant,
           labelStyle:
               const TextStyle(fontSize: 15, fontWeight: FontWeight.w600),
-          tabs: [
-            for (var i = 0; i < _labels.length; i++) _buildTab(i),
-          ],
+          tabs: [for (final tab in WorkTab.values) _buildTab(tab)],
         ),
       ),
       body: TabBarView(
         controller: _tabController,
-        children: [
-          for (final f in _filters)
-            _BookingList(filter: f, onCount: (c) => _setCount(f, c)),
-        ],
+        children: [for (final tab in WorkTab.values) _BookingList(tab: tab)],
       ),
     );
   }
 }
 
-/// A paginated, refreshable list of bookings for one filter.
-class _BookingList extends StatefulWidget {
-  const _BookingList({required this.filter, this.onCount});
+/// A paginated, refreshable list of the jobs on one [WorkTab].
+class _BookingList extends ConsumerStatefulWidget {
+  const _BookingList({required this.tab});
 
-  final String filter;
-
-  /// Reports the total job count for this filter (from pagination) so the parent
-  /// can badge the tab.
-  final ValueChanged<int>? onCount;
+  final WorkTab tab;
 
   @override
-  State<_BookingList> createState() => _BookingListState();
+  ConsumerState<_BookingList> createState() => _BookingListState();
 }
 
-class _BookingListState extends State<_BookingList>
+class _BookingListState extends ConsumerState<_BookingList>
     with AutomaticKeepAliveClientMixin {
   final _scrollController = ScrollController();
-  final List<Booking> _bookings = [];
-
-  bool _loading = false;
-  bool _loadingMore = false;
-  bool _hasMore = true;
-  int _page = 1;
-  String? _error;
 
   @override
   bool get wantKeepAlive => true;
@@ -230,7 +222,6 @@ class _BookingListState extends State<_BookingList>
   void initState() {
     super.initState();
     _scrollController.addListener(_onScroll);
-    _load(reset: true);
   }
 
   @override
@@ -241,100 +232,85 @@ class _BookingListState extends State<_BookingList>
 
   void _onScroll() {
     if (_scrollController.position.pixels >=
-            _scrollController.position.maxScrollExtent - 300 &&
-        !_loadingMore &&
-        _hasMore) {
-      _load();
+        _scrollController.position.maxScrollExtent - 300) {
+      // The notifier ignores this while a page is in flight or the server has
+      // nothing more, so there is no need to track that here.
+      ref.read(bookingListProvider(widget.tab).notifier).loadMore();
     }
-  }
-
-  Future<void> _load({bool reset = false}) async {
-    if (reset) {
-      setState(() {
-        _loading = true;
-        _error = null;
-        _page = 1;
-        _hasMore = true;
-      });
-    } else {
-      if (_loadingMore || !_hasMore) return;
-      setState(() => _loadingMore = true);
-    }
-
-    final res = await ApiService.getInspectorBookings(
-      filter: widget.filter,
-      page: reset ? 1 : _page,
-    );
-    if (!mounted) return;
-
-    int? total;
-    setState(() {
-      _loading = false;
-      _loadingMore = false;
-      if (res['success'] == true) {
-        final list = (res['bookings'] as List).cast<Booking>();
-        if (reset) _bookings.clear();
-        _bookings.addAll(list);
-        final pagination = res['pagination'];
-        _hasMore = pagination?.hasMore ?? false;
-        if (_hasMore) _page = (pagination?.currentPage ?? _page) + 1;
-        // Prefer the server's total; fall back to what we've loaded.
-        total = pagination?.total ?? _bookings.length;
-      } else {
-        _error = res['message']?.toString() ?? 'Failed to load bookings.';
-      }
-    });
-    if (total != null) widget.onCount?.call(total!);
   }
 
   Future<void> _openBooking(Booking b) async {
     final changed = await Navigator.push<bool>(
       context,
-      MaterialPageRoute(
-        builder: (_) => BookingDetailScreen(bookingId: b.id),
-      ),
+      MaterialPageRoute(builder: (_) => BookingDetailScreen(bookingId: b.id)),
     );
-    if (changed == true) _load(reset: true);
+    if (!mounted || changed != true) return;
+    // Refresh every tab, not just this one: finishing the workflow moves the
+    // job into Done, and reloading only this list would leave Done stale.
+    ref.read(assignmentsRevisionProvider.notifier).bump();
   }
 
   @override
   Widget build(BuildContext context) {
     super.build(context);
 
-    if (_loading && _bookings.isEmpty) {
-      return const Center(child: CircularProgressIndicator());
-    }
-    if (_error != null && _bookings.isEmpty) {
-      return _ErrorView(message: _error!, onRetry: () => _load(reset: true));
-    }
-    if (_bookings.isEmpty) {
+    final async = ref.watch(bookingListProvider(widget.tab));
+
+    return async.when(
+      // A bump of assignmentsRevision is a dependency change, which Riverpod
+      // treats as a reload — and `when` shows `loading` on a reload by default.
+      // Without this, every auto-refresh would blank the jobs behind a spinner;
+      // with it the current list stays put until the new data lands.
+      skipLoadingOnReload: true,
+      loading: () => const Center(child: CircularProgressIndicator()),
+      error: (e, _) => _ErrorView(
+        message: e is BookingFetchException
+            ? e.message
+            : 'Failed to load bookings.',
+        onRetry: () => ref.invalidate(bookingListProvider(widget.tab)),
+      ),
+      data: (state) => _buildList(state),
+    );
+  }
+
+  Widget _buildList(BookingListState state) {
+    Future<void> refresh() =>
+        ref.read(bookingListProvider(widget.tab).notifier).refresh();
+
+    if (state.bookings.isEmpty) {
       return RefreshIndicator(
-        onRefresh: () => _load(reset: true),
+        onRefresh: refresh,
         child: ListView(
-          children: const [
-            SizedBox(height: 120),
-            _EmptyView(),
+          children: [
+            const SizedBox(height: 120),
+            _EmptyView(
+              message: widget.tab == WorkTab.done
+                  ? 'No completed jobs yet'
+                  : 'No jobs here',
+            ),
           ],
         ),
       );
     }
 
+    final showFooter = state.hasMore;
     return RefreshIndicator(
-      onRefresh: () => _load(reset: true),
+      onRefresh: refresh,
       child: ListView.builder(
         controller: _scrollController,
         padding: const EdgeInsets.fromLTRB(16, 16, 16, 24),
-        itemCount: _bookings.length + (_hasMore ? 1 : 0),
+        itemCount: state.bookings.length + (showFooter ? 1 : 0),
         itemBuilder: (context, index) {
-          if (index >= _bookings.length) {
+          if (index >= state.bookings.length) {
             return const Padding(
               padding: EdgeInsets.symmetric(vertical: 16),
               child: Center(child: CircularProgressIndicator()),
             );
           }
+          final booking = state.bookings[index];
           return _BookingCard(
-            booking: _bookings[index],
-            onTap: () => _openBooking(_bookings[index]),
+            booking: booking,
+            onTap: () => _openBooking(booking),
           );
         },
       ),
@@ -488,20 +464,22 @@ class _BookingCard extends StatelessWidget {
 }
 
 class _EmptyView extends StatelessWidget {
-  const _EmptyView();
+  const _EmptyView({required this.message});
+
+  final String message;
 
   @override
   Widget build(BuildContext context) {
-    return const Center(
+    return Center(
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
-          Icon(Icons.assignment_turned_in_outlined,
+          const Icon(Icons.assignment_turned_in_outlined,
               size: 56, color: CarSpyColors.outlineVariant),
-          SizedBox(height: 12),
+          const SizedBox(height: 12),
           Text(
-            'No jobs here',
-            style: TextStyle(
+            message,
+            style: const TextStyle(
               fontSize: 16,
               color: CarSpyColors.onSurfaceVariant,
               fontWeight: FontWeight.w500,

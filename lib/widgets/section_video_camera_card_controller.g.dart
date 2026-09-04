@@ -71,7 +71,7 @@ final class VideoCardControllerProvider
 }
 
 String _$videoCardControllerHash() =>
-    r'c82c4f5adb3f0442fd7163edfa261ad0482cf5ef';
+    r'2c0fd381ebee559305a700fa557794b4fb056fac';
 
 /// Owns the camera lifecycle and recording state for one card, keyed by a
 /// stable [cardId] so each on-screen card gets its own autoDisposed instance.

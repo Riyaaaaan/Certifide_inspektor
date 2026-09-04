@@ -42,7 +42,7 @@ final class InspectionNotifierProvider
 }
 
 String _$inspectionNotifierHash() =>
-    r'f4b9c6458c09f0effa70d3796b10df1a428eda41';
+    r'1cc6e2d7ee76b9461a5bd77e3f46bd09e6a5aa63';
 
 abstract class _$InspectionNotifier extends $Notifier<InspectionState> {
   InspectionState build();

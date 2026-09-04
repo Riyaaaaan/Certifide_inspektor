@@ -57,6 +57,23 @@ class NotificationService {
   /// 0 HOME · 1 REPORTS · 2 ATTENDANCE · 3 WORK ASSIGNED.
   static final ValueNotifier<int?> requestedTab = ValueNotifier<int?>(null);
 
+  /// Bumped whenever a push arrives that changes the inspector's assigned work.
+  /// The Work Assigned screen watches this and refetches, so a newly assigned
+  /// job appears without waiting for a pull-to-refresh.
+  ///
+  /// Only bumped on the UI isolate. A push handled while the app is
+  /// backgrounded runs in [firebaseMessagingBackgroundHandler]'s own isolate,
+  /// where this object is a different instance that nothing is listening to —
+  /// that case is covered by the tap path below and by the screen's
+  /// refresh-on-resume.
+  static final ValueNotifier<int> assignmentsRevision = ValueNotifier<int>(0);
+
+  /// Payload `type`s that mean the assigned-work list may have changed.
+  static const Set<String> _assignmentTypes = {
+    'inspection_assigned',
+    'inspections_today',
+  };
+
   static const int _tabAttendance = 2;
   static const int _tabWorkAssigned = 3;
 
@@ -239,6 +256,15 @@ class NotificationService {
     } catch (e) {
       log('createNotification error: $e', name: 'notifications');
     }
+
+    _signalAssignmentChange(data['type']?.toString());
+  }
+
+  /// Tell listeners the assigned-work list is stale. Cheap and idempotent —
+  /// firing twice for one push (arrival then tap) just costs one extra fetch.
+  static void _signalAssignmentChange(String? type) {
+    if (type == null || !_assignmentTypes.contains(type)) return;
+    assignmentsRevision.value++;
   }
 
   // ──────────────────────────────── Taps ────────────────────────────────
@@ -255,6 +281,8 @@ class NotificationService {
   /// ([FirebaseMessaging.getInitialMessage]) — so routing must work regardless
   /// of the current screen or app state.
   static void _routeByType(String? type) {
+    _signalAssignmentChange(type);
+
     final int? tab;
     switch (type) {
       case 'inspection_assigned':
